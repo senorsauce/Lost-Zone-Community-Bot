@@ -6,6 +6,7 @@ from config import TOKEN, DELETE_DELAY_SECONDS
 from radio import RadioCog
 from moderation import ModerationCog
 from dayz import DayzCog
+from ticketing import TicketingCog
 from announcement import AnnouncementCog
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -38,6 +39,7 @@ async def on_ready() -> None:
 async def main() -> None:
     await bot.add_cog(RadioCog(bot, DELETE_DELAY_SECONDS), override=True)
     await bot.add_cog(ModerationCog(bot))
+    await bot.add_cog(TicketingCog(bot))
     await bot.add_cog(DayzCog(bot))
     await bot.add_cog(AnnouncementCog(bot))
     await bot.start(TOKEN)
