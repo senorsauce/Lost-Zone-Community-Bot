@@ -14,7 +14,9 @@ logger = logging.getLogger(__name__)
 TICKET_TYPES = {
     "general_support": {
         "label": "General Support",
+        "category_name": "General",
         "category_key": "category_id",
+        "channel_prefix": "gen",
     }
 }
 
@@ -40,8 +42,9 @@ def parse_ticket_guild_configs(raw: str) -> dict[str, dict[str, int]]:
 
         try:
             normalized = {"channel_id": int(config["channel_id"])}
-            if config.get("category_id") not in (None, ""):
-                normalized["category_id"] = int(config["category_id"])
+            for key, value in config.items():
+                if (key == "category_id" or key.endswith("_category_id")) and value not in (None, ""):
+                    normalized[key] = int(value)
             configs[str(int(guild_id))] = normalized
         except (TypeError, ValueError) as exc:
             raise RuntimeError(
@@ -219,8 +222,11 @@ class TicketingCog(commands.Cog):
         enabled = self.get_enabled_types(guild.id)
         view = TicketPanelView(self) if "general_support" in enabled else None
         embed = discord.Embed(
-            title="Ticket types:",
-            description="Select a button below to contact the support team.",
+            title="Make a ticket:",
+            description=(
+                "Should you need assistance with anything, create a ticket below. "
+                "Our staff will get to your ticket as soon as possible; Please be patient. "
+            ),
             colour=discord.Colour.blurple(),
         )
         embed.set_footer(text="zvtbot-ticket-panel-v1")
@@ -314,13 +320,9 @@ class TicketingCog(commands.Cog):
             return
 
         await interaction.response.defer(ephemeral=True, thinking=True)
-        counters = self.state["counters"]
-        ticket_number = int(counters.get(str(guild.id), 0)) + 1
-        counters[str(guild.id)] = ticket_number
-        self._save_state()
-
+        ticket_type = TICKET_TYPES["general_support"]
         category = None
-        category_id = config.get("category_id")
+        category_id = config.get(ticket_type["category_key"])
         if category_id is not None:
             resolved_category = guild.get_channel(category_id)
             if resolved_category is None:
@@ -336,6 +338,23 @@ class TicketingCog(commands.Cog):
                     ephemeral=True,
                 )
                 return
+
+        counters = self.state["counters"]
+        last_ticket_number = int(counters.get(str(guild.id), 0))
+        existing_names = {channel.name for channel in guild.channels}
+        ticket_number = None
+        for offset in range(1, 10000):
+            candidate_number = (last_ticket_number + offset - 1) % 9999 + 1
+            if f"{ticket_type['channel_prefix']}-{candidate_number:04d}" not in existing_names:
+                ticket_number = candidate_number
+                break
+        if ticket_number is None:
+            await interaction.followup.send(
+                "No unique ticket number is available.", ephemeral=True
+            )
+            return
+        counters[str(guild.id)] = ticket_number
+        self._save_state()
 
         requester = interaction.user
         overwrites = dict(category.overwrites) if category is not None else {}
@@ -354,13 +373,34 @@ class TicketingCog(commands.Cog):
 
         try:
             channel = await guild.create_text_channel(
-                name=f"support-{ticket_number:04d}",
+                name=f"{ticket_type['channel_prefix']}-{ticket_number:04d}",
                 category=category,
                 overwrites=overwrites,
                 reason="General support ticket created",
             )
+            support_role = next(
+                (
+                    role
+                    for role in getattr(guild, "roles", [])
+                    if role.name == "Support Staff"
+                ),
+                None,
+            )
+            opening_embed = discord.Embed(
+                description=(
+                    f"{requester.mention} has opened a "
+                    f"{ticket_type['category_name']} ticket."
+                ),
+                colour=discord.Colour.blurple(),
+            )
+            opening_embed.add_field(name="Question:", value=f"*{issue}*", inline=False)
             await channel.send(
-                f"Ticket opened by {requester.mention}.\n\n**Issue:**\n{issue}"
+                content=(
+                    f"{requester.mention} - Thank you for opening a ticket. "
+                    "Please be patient while staff gets to your issue.\n"
+                    f"{support_role.mention if support_role else '@Support Staff'}"
+                ),
+                embed=opening_embed,
             )
         except (discord.Forbidden, discord.HTTPException):
             await interaction.followup.send(

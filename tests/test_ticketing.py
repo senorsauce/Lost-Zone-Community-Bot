@@ -64,10 +64,64 @@ class TicketPanelStartupTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(cog, "_configured_channel", new=AsyncMock(return_value=Channel())):
             await cog.upsert_panel(guild)
 
-        self.assertEqual(posted["embed"].title, "Ticket types:")
+        self.assertEqual(posted["embed"].title, "Make a ticket:")
+        self.assertEqual(
+            posted["embed"].description,
+            "Should you need assistance with anything, create a ticket below. "
+            "Our staff will get to your ticket as soon as possible; Please be patient. ",
+        )
         self.assertIsNone(posted["view"].timeout)
         self.assertEqual(posted["view"].children[0].label, "General Support")
         self.assertEqual(GeneralSupportModal(cog).children[0].text, "Describe your issue:")
+
+
+class TicketCreationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_general_ticket_uses_category_unique_name_and_opening_message(self):
+        bot = SimpleNamespace(user=object())
+        config = '{"123": {"channel_id": 456, "category_id": 789}}'
+        with patch.dict(
+            os.environ,
+            {"TICKET_GUILD_CONFIGS": config, "TICKET_STATE_PATH": os.devnull},
+        ):
+            cog = TicketingCog(bot)
+
+        class Category:
+            overwrites = {}
+
+        category = Category()
+        created_channel = SimpleNamespace(
+            mention="#gen-0002", send=AsyncMock()
+        )
+        guild = SimpleNamespace(
+            id=123,
+            channels=[SimpleNamespace(name="gen-0001")],
+            roles=[SimpleNamespace(name="Support Staff", mention="<@&99>")],
+            default_role=object(),
+            me=None,
+            get_channel=Mock(return_value=category),
+            create_text_channel=AsyncMock(return_value=created_channel),
+        )
+        requester = Mock(mention="<@42>")
+        interaction = SimpleNamespace(
+            guild=guild,
+            user=requester,
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+
+        with patch("ticketing.discord.CategoryChannel", Category):
+            await cog.create_ticket(interaction, "I need help")
+
+        guild.create_text_channel.assert_awaited_once()
+        channel_kwargs = guild.create_text_channel.await_args.kwargs
+        self.assertEqual(channel_kwargs["name"], "gen-0002")
+        self.assertIs(channel_kwargs["category"], category)
+        message_kwargs = created_channel.send.await_args.kwargs
+        self.assertIn("<@42> - Thank you for opening a ticket.", message_kwargs["content"])
+        self.assertIn("<@&99>", message_kwargs["content"])
+        self.assertIn("General ticket", message_kwargs["embed"].description)
+        self.assertEqual(message_kwargs["embed"].fields[0].name, "Question:")
+        self.assertEqual(message_kwargs["embed"].fields[0].value, "*I need help*")
 
 
 if __name__ == "__main__":
