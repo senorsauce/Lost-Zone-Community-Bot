@@ -14,9 +14,17 @@ logger = logging.getLogger(__name__)
 TICKET_TYPES = {
     "general_support": {
         "label": "General Support",
+        "emoji": "❓",
         "category_name": "General",
-        "category_key": "category_id",
         "channel_prefix": "gen",
+        "question_label": "Question:",
+    },
+    "whitelist_submission": {
+        "label": "Whitelist Submission",
+        "emoji": "✍️",
+        "category_name": "Whitelist",
+        "channel_prefix": "wls",
+        "question_label": "What is your Character's Name?",
     }
 }
 
@@ -42,9 +50,6 @@ def parse_ticket_guild_configs(raw: str) -> dict[str, dict[str, int]]:
 
         try:
             normalized = {"channel_id": int(config["channel_id"])}
-            for key, value in config.items():
-                if (key == "category_id" or key.endswith("_category_id")) and value not in (None, ""):
-                    normalized[key] = int(value)
             configs[str(int(guild_id))] = normalized
         except (TypeError, ValueError) as exc:
             raise RuntimeError(
@@ -54,24 +59,64 @@ def parse_ticket_guild_configs(raw: str) -> dict[str, dict[str, int]]:
     return configs
 
 
+def parse_ticket_category_configs(raw: str) -> dict[str, dict[str, int]]:
+    if not raw.strip():
+        return {}
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"TICKET_CATEGORY_CONFIGS must be valid JSON: {exc.msg}") from exc
+
+    if not isinstance(parsed, dict):
+        raise RuntimeError("TICKET_CATEGORY_CONFIGS must be a JSON object keyed by guild id.")
+
+    configs: dict[str, dict[str, int]] = {}
+    for guild_id, categories in parsed.items():
+        if not isinstance(categories, dict):
+            raise RuntimeError(f"TICKET_CATEGORY_CONFIGS[{guild_id}] must be an object.")
+
+        try:
+            configs[str(int(guild_id))] = {
+                ticket_type: int(category_id)
+                for ticket_type, category_id in categories.items()
+                if category_id not in (None, "")
+            }
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"TICKET_CATEGORY_CONFIGS[{guild_id}] IDs must be integers."
+            ) from exc
+
+    return configs
+
+
 class TicketPanelView(discord.ui.View):
-    def __init__(self, cog: "TicketingCog"):
+    def __init__(self, cog: "TicketingCog", guild_id: int):
         super().__init__(timeout=None)
         self.cog = cog
-        self.add_item(TicketPanelButton(cog))
+        for ticket_type_key in cog.get_enabled_types(guild_id):
+            self.add_item(TicketPanelButton(cog, ticket_type_key))
 
 
 class TicketPanelButton(discord.ui.Button):
-    def __init__(self, cog: "TicketingCog"):
+    def __init__(self, cog: "TicketingCog", ticket_type_key: str):
+        ticket_type = TICKET_TYPES[ticket_type_key]
         super().__init__(
-            label="General Support",
+            label=ticket_type["label"],
             style=discord.ButtonStyle.primary,
-            custom_id="ticketing:general_support",
+            emoji=ticket_type["emoji"],
+            custom_id=f"ticketing:{ticket_type_key}",
         )
         self.cog = cog
+        self.ticket_type_key = ticket_type_key
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        await interaction.response.send_modal(GeneralSupportModal(self.cog))
+        modal_type = (
+            GeneralSupportModal
+            if self.ticket_type_key == "general_support"
+            else WhitelistSubmissionModal
+        )
+        await interaction.response.send_modal(modal_type(self.cog))
 
 
 class GeneralSupportModal(discord.ui.Modal, title="General Support"):
@@ -88,7 +133,28 @@ class GeneralSupportModal(discord.ui.Modal, title="General Support"):
         self.cog = cog
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        await self.cog.create_ticket(interaction, self.issue.component.value)
+        await self.cog.create_ticket(
+            interaction, self.issue.component.value, "general_support"
+        )
+
+
+class WhitelistSubmissionModal(discord.ui.Modal, title="Whitelist Submission"):
+    character_name = discord.ui.Label(
+        text="What is your Character's Name?",
+        component=discord.ui.TextInput(
+            style=discord.TextStyle.short,
+            max_length=100,
+        ),
+    )
+
+    def __init__(self, cog: "TicketingCog"):
+        super().__init__()
+        self.cog = cog
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await self.cog.create_ticket(
+            interaction, self.character_name.component.value, "whitelist_submission"
+        )
 
 
 class TicketConfigView(discord.ui.View):
@@ -140,8 +206,17 @@ class TicketingCog(commands.Cog):
         self.guild_configs = parse_ticket_guild_configs(
             os.getenv("TICKET_GUILD_CONFIGS", "")
         )
+        self.category_configs = parse_ticket_category_configs(
+            os.getenv("TICKET_CATEGORY_CONFIGS", "")
+        )
         self.state_path = os.getenv("TICKET_STATE_PATH", "ticket_state.json")
         self.state = self._load_state()
+        if self.state.get("ticket_types_version", 1) < 2:
+            for enabled_types in self.state["enabled_types"].values():
+                if "general_support" in enabled_types:
+                    enabled_types.append("whitelist_submission")
+            self.state["ticket_types_version"] = 2
+            self._save_state()
         self.panel_messages: dict[int, discord.Message] = {}
 
     def _load_state(self) -> dict[str, Any]:
@@ -220,14 +295,16 @@ class TicketingCog(commands.Cog):
             return
 
         enabled = self.get_enabled_types(guild.id)
-        view = TicketPanelView(self) if "general_support" in enabled else None
+        view = None
+        if enabled:
+            view = TicketPanelView(self, guild.id)
         embed = discord.Embed(
             title="Make a ticket:",
             description=(
                 "Should you need assistance with anything, create a ticket below. "
                 "Our staff will get to your ticket as soon as possible; Please be patient. "
             ),
-            colour=discord.Colour.blurple(),
+            colour=discord.Colour(0x3C3CE8),
         )
         embed.set_footer(text="zvtbot-ticket-panel-v1")
 
@@ -303,7 +380,10 @@ class TicketingCog(commands.Cog):
         )
 
     async def create_ticket(
-        self, interaction: discord.Interaction, issue: str
+        self,
+        interaction: discord.Interaction,
+        issue: str,
+        ticket_type_key: str = "general_support",
     ) -> None:
         guild = interaction.guild
         if guild is None:
@@ -320,9 +400,9 @@ class TicketingCog(commands.Cog):
             return
 
         await interaction.response.defer(ephemeral=True, thinking=True)
-        ticket_type = TICKET_TYPES["general_support"]
+        ticket_type = TICKET_TYPES[ticket_type_key]
         category = None
-        category_id = config.get(ticket_type["category_key"])
+        category_id = self.category_configs.get(str(guild.id), {}).get(ticket_type_key)
         if category_id is not None:
             resolved_category = guild.get_channel(category_id)
             if resolved_category is None:
@@ -334,7 +414,24 @@ class TicketingCog(commands.Cog):
                 category = resolved_category
             else:
                 await interaction.followup.send(
-                    "The configured ticket category could not be found. Check TICKET_GUILD_CONFIGS.",
+                    f"The configured {ticket_type['category_name']} ticket category could not be found. "
+                    "Check TICKET_CATEGORY_CONFIGS.",
+                    ephemeral=True,
+                )
+                return
+        else:
+            category = next(
+                (
+                    candidate
+                    for candidate in getattr(guild, "categories", [])
+                    if candidate.name.casefold() == ticket_type["category_name"].casefold()
+                ),
+                None,
+            )
+            if category is None:
+                await interaction.followup.send(
+                    f"Create a '{ticket_type['category_name']}' category or configure "
+                    f"'{ticket_type_key}' in TICKET_CATEGORY_CONFIGS.",
                     ephemeral=True,
                 )
                 return
@@ -376,29 +473,23 @@ class TicketingCog(commands.Cog):
                 name=f"{ticket_type['channel_prefix']}-{ticket_number:04d}",
                 category=category,
                 overwrites=overwrites,
-                reason="General support ticket created",
-            )
-            support_role = next(
-                (
-                    role
-                    for role in getattr(guild, "roles", [])
-                    if role.name == "Support Staff"
-                ),
-                None,
+                reason=f"{ticket_type['label']} ticket created",
             )
             opening_embed = discord.Embed(
                 description=(
                     f"{requester.mention} has opened a "
                     f"{ticket_type['category_name']} ticket."
                 ),
-                colour=discord.Colour.blurple(),
+                colour=discord.Colour(0x3C3CE8),
             )
-            opening_embed.add_field(name="Question:", value=f"*{issue}*", inline=False)
+            opening_embed.add_field(
+                name=ticket_type["question_label"], value=f"*{issue}*", inline=False
+            )
             await channel.send(
                 content=(
                     f"{requester.mention} - Thank you for opening a ticket. "
                     "Please be patient while staff gets to your issue.\n"
-                    f"{support_role.mention if support_role else '@Support Staff'}"
+                    "@ Support Staff"
                 ),
                 embed=opening_embed,
             )

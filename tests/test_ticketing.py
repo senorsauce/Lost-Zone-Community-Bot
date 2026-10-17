@@ -7,12 +7,14 @@ from ticketing import (
     GeneralSupportModal,
     TicketPanelView,
     TicketingCog,
+    WhitelistSubmissionModal,
+    parse_ticket_category_configs,
     parse_ticket_guild_configs,
 )
 
 
 class TicketGuildConfigTests(unittest.TestCase):
-    def test_parses_per_guild_channel_and_optional_category(self):
+    def test_parses_per_guild_panel_channels(self):
         configs = parse_ticket_guild_configs(
             '{"123": {"channel_id": "456", "category_id": "789"}, '
             '"234": {"channel_id": 567}}'
@@ -20,7 +22,21 @@ class TicketGuildConfigTests(unittest.TestCase):
 
         self.assertEqual(
             configs,
-            {"123": {"channel_id": 456, "category_id": 789}, "234": {"channel_id": 567}},
+            {"123": {"channel_id": 456}, "234": {"channel_id": 567}},
+        )
+
+    def test_parses_ticket_categories_independently_per_guild(self):
+        configs = parse_ticket_category_configs(
+            '{"123": {"general_support": "789", "whitelist_submission": 987}, '
+            '"234": {"general_support": 654}}'
+        )
+
+        self.assertEqual(
+            configs,
+            {
+                "123": {"general_support": 789, "whitelist_submission": 987},
+                "234": {"general_support": 654},
+            },
         )
 
     def test_rejects_missing_panel_channel(self):
@@ -71,17 +87,32 @@ class TicketPanelStartupTests(unittest.IsolatedAsyncioTestCase):
             "Our staff will get to your ticket as soon as possible; Please be patient. ",
         )
         self.assertIsNone(posted["view"].timeout)
-        self.assertEqual(posted["view"].children[0].label, "General Support")
+        self.assertEqual(
+            [button.label for button in posted["view"].children],
+            ["General Support", "Whitelist Submission"],
+        )
+        self.assertEqual(posted["view"].children[0].emoji.name, "❓")
+        self.assertEqual(posted["view"].children[1].emoji.name, "✍️")
+        self.assertEqual(posted["embed"].colour.value, 0x3C3CE8)
         self.assertEqual(GeneralSupportModal(cog).children[0].text, "Describe your issue:")
+        self.assertEqual(
+            WhitelistSubmissionModal(cog).children[0].text,
+            "What is your Character's Name?",
+        )
 
 
 class TicketCreationTests(unittest.IsolatedAsyncioTestCase):
     async def test_general_ticket_uses_category_unique_name_and_opening_message(self):
         bot = SimpleNamespace(user=object())
-        config = '{"123": {"channel_id": 456, "category_id": 789}}'
+        config = '{"123": {"channel_id": 456}}'
+        categories = '{"123": {"general_support": 789}}'
         with patch.dict(
             os.environ,
-            {"TICKET_GUILD_CONFIGS": config, "TICKET_STATE_PATH": os.devnull},
+            {
+                "TICKET_GUILD_CONFIGS": config,
+                "TICKET_CATEGORY_CONFIGS": categories,
+                "TICKET_STATE_PATH": os.devnull,
+            },
         ):
             cog = TicketingCog(bot)
 
@@ -118,10 +149,64 @@ class TicketCreationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(channel_kwargs["category"], category)
         message_kwargs = created_channel.send.await_args.kwargs
         self.assertIn("<@42> - Thank you for opening a ticket.", message_kwargs["content"])
-        self.assertIn("<@&99>", message_kwargs["content"])
+        self.assertIn("@ Support Staff", message_kwargs["content"])
+        self.assertNotIn("<@&99>", message_kwargs["content"])
         self.assertIn("General ticket", message_kwargs["embed"].description)
         self.assertEqual(message_kwargs["embed"].fields[0].name, "Question:")
         self.assertEqual(message_kwargs["embed"].fields[0].value, "*I need help*")
+
+    async def test_whitelist_answer_is_posted_in_whitelist_ticket(self):
+        bot = SimpleNamespace(user=object())
+        config = '{"123": {"channel_id": 456}}'
+        categories = '{"123": {"whitelist_submission": 987}}'
+        with patch.dict(
+            os.environ,
+            {
+                "TICKET_GUILD_CONFIGS": config,
+                "TICKET_CATEGORY_CONFIGS": categories,
+                "TICKET_STATE_PATH": os.devnull,
+            },
+        ):
+            cog = TicketingCog(bot)
+
+        class Category:
+            name = "Whitelist"
+            overwrites = {}
+
+        category = Category()
+        created_channel = SimpleNamespace(mention="#wls-0001", send=AsyncMock())
+        guild = SimpleNamespace(
+            id=123,
+            channels=[],
+            roles=[],
+            default_role=object(),
+            me=None,
+            get_channel=Mock(return_value=category),
+            create_text_channel=AsyncMock(return_value=created_channel),
+        )
+        requester = Mock(mention="<@42>")
+        interaction = SimpleNamespace(
+            guild=guild,
+            user=requester,
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+
+        with patch("ticketing.discord.CategoryChannel", Category):
+            await cog.create_ticket(
+                interaction, "Aster Vale", "whitelist_submission"
+            )
+
+        channel_kwargs = guild.create_text_channel.await_args.kwargs
+        self.assertEqual(channel_kwargs["name"], "wls-0001")
+        self.assertIs(channel_kwargs["category"], category)
+        message_kwargs = created_channel.send.await_args.kwargs
+        self.assertIn("Whitelist ticket", message_kwargs["embed"].description)
+        self.assertEqual(
+            message_kwargs["embed"].fields[0].name,
+            "What is your Character's Name?",
+        )
+        self.assertEqual(message_kwargs["embed"].fields[0].value, "*Aster Vale*")
 
 
 if __name__ == "__main__":
