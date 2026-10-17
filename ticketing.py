@@ -211,11 +211,14 @@ class TicketingCog(commands.Cog):
         )
         self.state_path = os.getenv("TICKET_STATE_PATH", "ticket_state.json")
         self.state = self._load_state()
-        if self.state.get("ticket_types_version", 1) < 2:
+        if self.state.get("ticket_types_version", 1) < 3:
             for enabled_types in self.state["enabled_types"].values():
-                if "general_support" in enabled_types:
+                if (
+                    "general_support" in enabled_types
+                    and "whitelist_submission" not in enabled_types
+                ):
                     enabled_types.append("whitelist_submission")
-            self.state["ticket_types_version"] = 2
+            self.state["ticket_types_version"] = 3
             self._save_state()
         self.panel_messages: dict[int, discord.Message] = {}
 

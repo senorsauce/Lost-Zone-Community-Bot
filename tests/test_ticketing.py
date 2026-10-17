@@ -1,4 +1,6 @@
 import os
+import json
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -45,6 +47,30 @@ class TicketGuildConfigTests(unittest.TestCase):
 
 
 class TicketPanelStartupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_migration_adds_whitelist_to_existing_panel_preferences(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = os.path.join(directory, "ticket_state.json")
+            with open(state_path, "w", encoding="utf-8") as state_file:
+                json.dump(
+                    {
+                        "ticket_types_version": 2,
+                        "counters": {},
+                        "enabled_types": {"123": ["general_support"]},
+                    },
+                    state_file,
+                )
+
+            with patch.dict(
+                os.environ,
+                {"TICKET_GUILD_CONFIGS": "", "TICKET_STATE_PATH": state_path},
+            ):
+                cog = TicketingCog(SimpleNamespace())
+
+        self.assertEqual(
+            cog.get_enabled_types(123),
+            ["general_support", "whitelist_submission"],
+        )
+
     async def test_missing_guild_config_is_logged(self):
         with patch.dict(
             os.environ,
