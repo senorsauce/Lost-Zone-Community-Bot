@@ -6,7 +6,9 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from ticketing import (
+    EVIDENCE_ACKNOWLEDGMENT,
     GeneralSupportModal,
+    TicketAcknowledgmentModal,
     TicketPanelView,
     TicketSubmissionModal,
     TicketingCog,
@@ -63,7 +65,7 @@ class TicketPanelStartupTests(unittest.IsolatedAsyncioTestCase):
             with open(state_path, "w", encoding="utf-8") as state_file:
                 json.dump(
                     {
-                        "ticket_types_version": 4,
+                        "ticket_types_version": 6,
                         "counters": {},
                         "enabled_types": {
                             "123": ["general_support", "whitelist_submission"]
@@ -86,6 +88,8 @@ class TicketPanelStartupTests(unittest.IsolatedAsyncioTestCase):
                 "warfare",
                 "rulebreaks",
                 "admin_reports",
+                "bug_report",
+                "compensation_request",
             ],
         )
 
@@ -138,7 +142,9 @@ class TicketPanelStartupTests(unittest.IsolatedAsyncioTestCase):
                 "Whitelist Submission",
                 "Warfare",
                 "Rulebreak Report",
-                "Admin Reports",
+                "Admin Report",
+                "Bug Report",
+                "Compensation Request",
             ],
         )
         self.assertEqual(posted["view"].children[0].emoji.name, "❓")
@@ -146,6 +152,8 @@ class TicketPanelStartupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(posted["view"].children[2].emoji.name, "⚔️")
         self.assertEqual(posted["view"].children[3].emoji.name, "❌")
         self.assertEqual(posted["view"].children[4].emoji.name, "🚨")
+        self.assertEqual(posted["view"].children[5].emoji.name, "🪲")
+        self.assertEqual(posted["view"].children[6].emoji.name, "🪙")
         self.assertEqual(posted["embed"].colour.value, 0x3C3CE8)
         self.assertEqual(GeneralSupportModal(cog).children[0].text, "Describe your issue:")
         self.assertEqual(
@@ -153,18 +161,13 @@ class TicketPanelStartupTests(unittest.IsolatedAsyncioTestCase):
             "What is your Character's Name?",
         )
 
-    async def test_report_modals_show_preface_before_questions(self):
+    async def test_report_modals_have_questions_without_prefaces(self):
         with patch.dict(os.environ, {"TICKET_STATE_PATH": os.devnull}):
             cog = TicketingCog(SimpleNamespace())
 
         rulebreak_modal = TicketSubmissionModal(cog, "rulebreaks")
         self.assertEqual(
-            rulebreak_modal.children[0].content,
-            "When filling out these questions, be as specific and detailed as "
-            "possible. Post any proof you have after.",
-        )
-        self.assertEqual(
-            [item.text for item in rulebreak_modal.children[1:]],
+            [item.text for item in rulebreak_modal.children],
             [
                 "Player(s) involved:",
                 "Player(s) being accused:",
@@ -175,19 +178,39 @@ class TicketPanelStartupTests(unittest.IsolatedAsyncioTestCase):
 
         admin_modal = TicketSubmissionModal(cog, "admin_reports")
         self.assertEqual(
-            admin_modal.children[0].content,
-            "Admin reports are taken very seriously and are handled only by "
-            "uninvolved Management. As such, you must provide adequate proof "
-            "of your accusation. ",
-        )
-        self.assertEqual(
-            [item.text for item in admin_modal.children[1:]],
+            [item.text for item in admin_modal.children],
             [
                 "Player(s) involved:",
                 "Admin(s) accused:",
                 "Describe the incident:",
             ],
         )
+
+        bug_modal = TicketSubmissionModal(cog, "bug_report")
+        self.assertEqual(
+            [item.text for item in bug_modal.children],
+            [
+                "How did this first occur?",
+                "How did the bug first happen?",
+                "Is it repeatable?",
+            ],
+        )
+        compensation_modal = TicketSubmissionModal(cog, "compensation_request")
+        self.assertEqual(
+            [item.text for item in compensation_modal.children],
+            [
+                "What item(s) were lost, and require compensation?",
+                "How did the loss occur?",
+            ],
+        )
+        acknowledgment_modal = TicketAcknowledgmentModal(
+            cog, "rulebreaks", {}, EVIDENCE_ACKNOWLEDGMENT
+        )
+        self.assertEqual(
+            acknowledgment_modal.children[0].content,
+            EVIDENCE_ACKNOWLEDGMENT,
+        )
+        self.assertEqual(acknowledgment_modal.children[1].text, "Your response:")
 
 
 class TicketCreationTests(unittest.IsolatedAsyncioTestCase):
@@ -351,6 +374,54 @@ class TicketCreationTests(unittest.IsolatedAsyncioTestCase):
             "What is your Character's Name?",
         )
         self.assertEqual(message_kwargs["embed"].fields[0].value, "*Aster Vale*")
+
+    async def test_compensation_answers_and_acknowledgment_are_posted(self):
+        bot = SimpleNamespace(user=object())
+        config = '{"123": {"channel_id": 456}}'
+        categories = '{"123": {"compensation_request": 987}}'
+        with patch.dict(
+            os.environ,
+            {
+                "TICKET_GUILD_CONFIGS": config,
+                "TICKET_CATEGORY_CONFIGS": categories,
+                "TICKET_STATE_PATH": os.devnull,
+            },
+        ):
+            cog = TicketingCog(bot)
+
+        class Category:
+            overwrites = {}
+
+        category = Category()
+        created_channel = SimpleNamespace(mention="#cmp-0001", send=AsyncMock())
+        guild = SimpleNamespace(
+            id=123,
+            channels=[],
+            default_role=object(),
+            me=None,
+            get_channel=Mock(return_value=category),
+            create_text_channel=AsyncMock(return_value=created_channel),
+        )
+        interaction = SimpleNamespace(
+            guild=guild,
+            user=Mock(mention="<@42>"),
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        answers = {
+            "What item(s) were lost, and require compensation?": "A vehicle",
+            "How did the loss occur?": "Server crash",
+            EVIDENCE_ACKNOWLEDGMENT: "Yes, I understand.",
+        }
+
+        with patch("ticketing.discord.CategoryChannel", Category):
+            await cog.create_ticket(interaction, answers, "compensation_request")
+
+        channel_kwargs = guild.create_text_channel.await_args.kwargs
+        self.assertEqual(channel_kwargs["name"], "cmp-0001")
+        fields = created_channel.send.await_args.kwargs["embed"].fields
+        self.assertEqual(fields[-1].name, EVIDENCE_ACKNOWLEDGMENT)
+        self.assertEqual(fields[-1].value, "*Yes, I understand.*")
 
 
 if __name__ == "__main__":

@@ -10,6 +10,12 @@ from discord.ext import commands
 
 logger = logging.getLogger(__name__)
 
+EVIDENCE_ACKNOWLEDGMENT = (
+    "Do you understand that without providing evidence of the situation, that "
+    "there is little staff can do for you, and therefore are not entitled to a "
+    "satisfying resolution?"
+)
+
 
 TICKET_TYPES = {
     "general_support": {
@@ -62,10 +68,6 @@ TICKET_TYPES = {
         "category_name": "Rulebreaks",
         "modal_title": "Rulebreak Report",
         "channel_prefix": "rbr",
-        "preface": (
-            "When filling out these questions, be as specific and detailed as "
-            "possible. Post any proof you have after."
-        ),
         "questions": [
             {"label": "Player(s) involved:", "max_length": 500},
             {"label": "Player(s) being accused:", "max_length": 500},
@@ -76,18 +78,14 @@ TICKET_TYPES = {
                 "max_length": 2000,
             },
         ],
+        "acknowledgment": EVIDENCE_ACKNOWLEDGMENT,
     },
     "admin_reports": {
-        "label": "Admin Reports",
+        "label": "Admin Report",
         "emoji": "🚨",
         "category_name": "Admin Reports",
         "modal_title": "Admin Report",
         "channel_prefix": "adm",
-        "preface": (
-            "Admin reports are taken very seriously and are handled only by "
-            "uninvolved Management. As such, you must provide adequate proof "
-            "of your accusation. "
-        ),
         "questions": [
             {"label": "Player(s) involved:", "max_length": 500},
             {"label": "Admin(s) accused:", "max_length": 500},
@@ -97,6 +95,34 @@ TICKET_TYPES = {
                 "max_length": 2000,
             },
         ],
+        "acknowledgment": EVIDENCE_ACKNOWLEDGMENT,
+    },
+    "bug_report": {
+        "label": "Bug Report",
+        "emoji": "🪲",
+        "category_name": "Bug Report",
+        "modal_title": "Bug Report",
+        "channel_prefix": "bug",
+        "questions": [
+            {"label": "How did this first occur?", "max_length": 1000},
+            {"label": "How did the bug first happen?", "max_length": 1000},
+            {"label": "Is it repeatable?", "max_length": 500},
+        ],
+    },
+    "compensation_request": {
+        "label": "Compensation Request",
+        "emoji": "🪙",
+        "category_name": "Compensation Request",
+        "modal_title": "Compensation Request",
+        "channel_prefix": "cmp",
+        "questions": [
+            {
+                "label": "What item(s) were lost, and require compensation?",
+                "max_length": 1000,
+            },
+            {"label": "How did the loss occur?", "max_length": 1000},
+        ],
+        "acknowledgment": EVIDENCE_ACKNOWLEDGMENT,
     },
 }
 
@@ -196,9 +222,6 @@ class TicketSubmissionModal(discord.ui.Modal):
         self.ticket_type_key = ticket_type_key
         self.questions: list[tuple[dict[str, Any], discord.ui.TextInput]] = []
 
-        if preface := ticket_type.get("preface"):
-            self.add_item(discord.ui.TextDisplay(content=preface))
-
         for question in ticket_type["questions"]:
             text_input = discord.ui.TextInput(
                 style=(
@@ -218,7 +241,42 @@ class TicketSubmissionModal(discord.ui.Modal):
             question["label"]: text_input.value
             for question, text_input in self.questions
         }
+        if acknowledgment := TICKET_TYPES[self.ticket_type_key].get("acknowledgment"):
+            await interaction.response.send_modal(
+                TicketAcknowledgmentModal(
+                    self.cog, self.ticket_type_key, answers, acknowledgment
+                )
+            )
+            return
         await self.cog.create_ticket(interaction, answers, self.ticket_type_key)
+
+
+class TicketAcknowledgmentModal(discord.ui.Modal, title="Final Acknowledgment"):
+    def __init__(
+        self,
+        cog: "TicketingCog",
+        ticket_type_key: str,
+        answers: dict[str, str],
+        acknowledgment: str,
+    ):
+        super().__init__()
+        self.cog = cog
+        self.ticket_type_key = ticket_type_key
+        self.answers = answers
+        self.add_item(discord.ui.TextDisplay(content=acknowledgment))
+        self.answer = discord.ui.TextInput(
+            style=discord.TextStyle.short,
+            max_length=500,
+        )
+        self.add_item(
+            discord.ui.Label(text="Your response:", component=self.answer)
+        )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        self.answers[EVIDENCE_ACKNOWLEDGMENT] = self.answer.value
+        await self.cog.create_ticket(
+            interaction, self.answers, self.ticket_type_key
+        )
 
 
 class GeneralSupportModal(TicketSubmissionModal):
@@ -285,7 +343,7 @@ class TicketingCog(commands.Cog):
         )
         self.state_path = os.getenv("TICKET_STATE_PATH", "ticket_state.json")
         self.state = self._load_state()
-        if self.state.get("ticket_types_version", 1) < 5:
+        if self.state.get("ticket_types_version", 1) < 7:
             for enabled_types in self.state["enabled_types"].values():
                 if "general_support" in enabled_types:
                     enabled_types.extend(
@@ -293,7 +351,7 @@ class TicketingCog(commands.Cog):
                         for ticket_type_key in TICKET_TYPES
                         if ticket_type_key not in enabled_types
                     )
-            self.state["ticket_types_version"] = 5
+            self.state["ticket_types_version"] = 7
             self._save_state()
         self.panel_messages: dict[int, discord.Message] = {}
 
@@ -570,6 +628,12 @@ class TicketingCog(commands.Cog):
                 opening_embed.add_field(
                     name=question.get("answer_label", question["label"]),
                     value=f"*{answer}*",
+                    inline=False,
+                )
+            if acknowledgment := ticket_type.get("acknowledgment"):
+                opening_embed.add_field(
+                    name=acknowledgment,
+                    value=f"*{answers.get(acknowledgment, '')}*",
                     inline=False,
                 )
             staff_text = "\n@ Support Staff" if ticket_type_key == "general_support" else ""
