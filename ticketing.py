@@ -16,16 +16,88 @@ TICKET_TYPES = {
         "label": "General Support",
         "emoji": "❓",
         "category_name": "General",
+        "modal_title": "General Support",
         "channel_prefix": "gen",
-        "question_label": "Question:",
+        "questions": [
+            {
+                "label": "Describe your issue:",
+                "answer_label": "Question:",
+                "multiline": True,
+                "max_length": 2000,
+            }
+        ],
     },
     "whitelist_submission": {
         "label": "Whitelist Submission",
         "emoji": "✍️",
         "category_name": "Whitelist",
+        "modal_title": "Whitelist Submission",
         "channel_prefix": "wls",
-        "question_label": "What is your Character's Name?",
-    }
+        "questions": [
+            {
+                "label": "What is your Character's Name?",
+                "max_length": 100,
+            }
+        ],
+    },
+    "warfare": {
+        "label": "Warfare",
+        "emoji": "⚔️",
+        "category_name": "Warfare",
+        "modal_title": "Warfare Report",
+        "channel_prefix": "war",
+        "questions": [
+            {"label": "Group attacking:", "max_length": 200},
+            {"label": "Node Being Attacked:", "max_length": 200},
+            {
+                "label": "Additional Information:",
+                "multiline": True,
+                "max_length": 2000,
+            },
+        ],
+    },
+    "rulebreaks": {
+        "label": "Rulebreak Report",
+        "emoji": "❌",
+        "category_name": "Rulebreaks",
+        "modal_title": "Rulebreak Report",
+        "channel_prefix": "rbr",
+        "preface": (
+            "When filling out these questions, be as specific and detailed as "
+            "possible. Post any proof you have after."
+        ),
+        "questions": [
+            {"label": "Player(s) involved:", "max_length": 500},
+            {"label": "Player(s) being accused:", "max_length": 500},
+            {"label": "Rule(s) being broken:", "max_length": 500},
+            {
+                "label": "Describe the incident:",
+                "multiline": True,
+                "max_length": 2000,
+            },
+        ],
+    },
+    "admin_reports": {
+        "label": "Admin Reports",
+        "emoji": "🚨",
+        "category_name": "Admin Reports",
+        "modal_title": "Admin Report",
+        "channel_prefix": "adm",
+        "preface": (
+            "Admin reports are taken very seriously and are handled only by "
+            "uninvolved Management. As such, you must provide adequate proof "
+            "of your accusation. "
+        ),
+        "questions": [
+            {"label": "Player(s) involved:", "max_length": 500},
+            {"label": "Admin(s) accused:", "max_length": 500},
+            {
+                "label": "Describe the incident:",
+                "multiline": True,
+                "max_length": 2000,
+            },
+        ],
+    },
 }
 
 
@@ -111,50 +183,52 @@ class TicketPanelButton(discord.ui.Button):
         self.ticket_type_key = ticket_type_key
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        modal_type = (
-            GeneralSupportModal
-            if self.ticket_type_key == "general_support"
-            else WhitelistSubmissionModal
+        await interaction.response.send_modal(
+            TicketSubmissionModal(self.cog, self.ticket_type_key)
         )
-        await interaction.response.send_modal(modal_type(self.cog))
 
 
-class GeneralSupportModal(discord.ui.Modal, title="General Support"):
-    issue = discord.ui.Label(
-        text="Describe your issue:",
-        component=discord.ui.TextInput(
-            style=discord.TextStyle.paragraph,
-            max_length=2000,
-        ),
-    )
-
-    def __init__(self, cog: "TicketingCog"):
-        super().__init__()
+class TicketSubmissionModal(discord.ui.Modal):
+    def __init__(self, cog: "TicketingCog", ticket_type_key: str):
+        ticket_type = TICKET_TYPES[ticket_type_key]
+        super().__init__(title=ticket_type["modal_title"])
         self.cog = cog
+        self.ticket_type_key = ticket_type_key
+        self.questions: list[tuple[dict[str, Any], discord.ui.TextInput]] = []
+
+        if preface := ticket_type.get("preface"):
+            self.add_item(discord.ui.TextDisplay(content=preface))
+
+        for question in ticket_type["questions"]:
+            text_input = discord.ui.TextInput(
+                style=(
+                    discord.TextStyle.paragraph
+                    if question.get("multiline")
+                    else discord.TextStyle.short
+                ),
+                max_length=question.get("max_length", 500),
+            )
+            self.add_item(
+                discord.ui.Label(text=question["label"], component=text_input)
+            )
+            self.questions.append((question, text_input))
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        await self.cog.create_ticket(
-            interaction, self.issue.component.value, "general_support"
-        )
+        answers = {
+            question["label"]: text_input.value
+            for question, text_input in self.questions
+        }
+        await self.cog.create_ticket(interaction, answers, self.ticket_type_key)
 
 
-class WhitelistSubmissionModal(discord.ui.Modal, title="Whitelist Submission"):
-    character_name = discord.ui.Label(
-        text="What is your Character's Name?",
-        component=discord.ui.TextInput(
-            style=discord.TextStyle.short,
-            max_length=100,
-        ),
-    )
-
+class GeneralSupportModal(TicketSubmissionModal):
     def __init__(self, cog: "TicketingCog"):
-        super().__init__()
-        self.cog = cog
+        super().__init__(cog, "general_support")
 
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        await self.cog.create_ticket(
-            interaction, self.character_name.component.value, "whitelist_submission"
-        )
+
+class WhitelistSubmissionModal(TicketSubmissionModal):
+    def __init__(self, cog: "TicketingCog"):
+        super().__init__(cog, "whitelist_submission")
 
 
 class TicketConfigView(discord.ui.View):
@@ -211,14 +285,15 @@ class TicketingCog(commands.Cog):
         )
         self.state_path = os.getenv("TICKET_STATE_PATH", "ticket_state.json")
         self.state = self._load_state()
-        if self.state.get("ticket_types_version", 1) < 3:
+        if self.state.get("ticket_types_version", 1) < 5:
             for enabled_types in self.state["enabled_types"].values():
-                if (
-                    "general_support" in enabled_types
-                    and "whitelist_submission" not in enabled_types
-                ):
-                    enabled_types.append("whitelist_submission")
-            self.state["ticket_types_version"] = 3
+                if "general_support" in enabled_types:
+                    enabled_types.extend(
+                        ticket_type_key
+                        for ticket_type_key in TICKET_TYPES
+                        if ticket_type_key not in enabled_types
+                    )
+            self.state["ticket_types_version"] = 5
             self._save_state()
         self.panel_messages: dict[int, discord.Message] = {}
 
@@ -385,7 +460,7 @@ class TicketingCog(commands.Cog):
     async def create_ticket(
         self,
         interaction: discord.Interaction,
-        issue: str,
+        issue: str | dict[str, str],
         ticket_type_key: str = "general_support",
     ) -> None:
         guild = interaction.guild
@@ -404,6 +479,11 @@ class TicketingCog(commands.Cog):
 
         await interaction.response.defer(ephemeral=True, thinking=True)
         ticket_type = TICKET_TYPES[ticket_type_key]
+        answers = (
+            {ticket_type["questions"][0]["label"]: issue}
+            if isinstance(issue, str)
+            else issue
+        )
         category = None
         category_id = self.category_configs.get(str(guild.id), {}).get(ticket_type_key)
         if category_id is not None:
@@ -485,14 +565,19 @@ class TicketingCog(commands.Cog):
                 ),
                 colour=discord.Colour(0x3C3CE8),
             )
-            opening_embed.add_field(
-                name=ticket_type["question_label"], value=f"*{issue}*", inline=False
-            )
+            for question in ticket_type["questions"]:
+                answer = answers.get(question["label"], "")
+                opening_embed.add_field(
+                    name=question.get("answer_label", question["label"]),
+                    value=f"*{answer}*",
+                    inline=False,
+                )
+            staff_text = "\n@ Support Staff" if ticket_type_key == "general_support" else ""
             await channel.send(
                 content=(
                     f"{requester.mention} - Thank you for opening a ticket. "
-                    "Please be patient while staff gets to your issue.\n"
-                    "@ Support Staff"
+                    "Please be patient while staff gets to your issue."
+                    f"{staff_text}"
                 ),
                 embed=opening_embed,
             )
