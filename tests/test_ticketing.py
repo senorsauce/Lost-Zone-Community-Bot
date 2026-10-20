@@ -331,7 +331,15 @@ class TicketPanelStartupTests(unittest.IsolatedAsyncioTestCase):
                 modal = response.send_modal.await_args.args[0]
                 self.assertIsInstance(modal, discord.ui.Modal)
                 self.assertLessEqual(len(modal.children), 5)
+                for index, (question, _) in enumerate(modal.question_fields):
+                    label = modal.children[index]
+                    self.assertLessEqual(len(label.text), 45)
+                    rendered_question = label.text
+                    if label.description:
+                        rendered_question += f" {label.description}"
+                    self.assertEqual(rendered_question, question)
                 self.assertIsInstance(modal.children[-1].component, discord.ui.FileUpload)
+                modal.to_dict()
 
     async def test_missing_guild_config_is_logged(self):
         with patch.dict(

@@ -135,6 +135,15 @@ def validate_upload_extension(filename: str) -> bool:
     return os.path.splitext(filename)[1].lower() in ALLOWED_FILE_EXTENSIONS
 
 
+def split_modal_label(label: str, max_length: int = 45) -> tuple[str, str | None]:
+    if len(label) <= max_length:
+        return label, None
+    split_at = label.rfind(" ", 0, max_length + 1)
+    if split_at <= 0:
+        split_at = max_length
+    return label[:split_at], label[split_at:].lstrip()
+
+
 def parse_ticket_guild_configs(raw: str) -> dict[str, dict[str, int]]:
     if not raw.strip():
         return {}
@@ -247,7 +256,14 @@ class TicketSubmissionModal(discord.ui.Modal):
                 ),
                 max_length=question["max_length"],
             )
-            self.add_item(discord.ui.Label(text=question["label"], component=field))
+            label, description = split_modal_label(question["label"])
+            self.add_item(
+                discord.ui.Label(
+                    text=label,
+                    description=description,
+                    component=field,
+                )
+            )
             self.question_fields.append((question["label"], field))
 
         self.upload_field = discord.ui.Label(
