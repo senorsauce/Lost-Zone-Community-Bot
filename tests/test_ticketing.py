@@ -1,6 +1,8 @@
 import json
+import io
 import os
 import unittest
+import zipfile
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -515,8 +517,10 @@ class StaffTicketCommandTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_accepting_close_request_locks_ticket_but_preserves_history(self):
         cog = await self._make_cog()
+        cog._archive_ticket_transcript = AsyncMock()
         channel = SimpleNamespace(
             id=55,
+            name="gen-0001",
             topic="ticket_type=general_support;ticket_owner_id=11",
             overwrites_for=Mock(return_value=discord.PermissionOverwrite()),
             set_permissions=AsyncMock(),
@@ -534,7 +538,8 @@ class StaffTicketCommandTests(unittest.IsolatedAsyncioTestCase):
             followup=SimpleNamespace(send=AsyncMock()),
         )
 
-        await cog.accept_close_request(interaction, 55, 11)
+        with patch("ticketing.discord.TextChannel", type(channel)):
+            await cog.accept_close_request(interaction, 55, 11)
 
         overwrite = channel.set_permissions.await_args.kwargs["overwrite"]
         self.assertTrue(overwrite.view_channel)
@@ -543,6 +548,160 @@ class StaffTicketCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("ticket_status=closed", channel.edit.await_args.kwargs["topic"])
         request_message.edit.assert_awaited_once()
         self.assertIsNone(request_message.edit.await_args.kwargs["view"])
+
+    async def test_transcript_failure_leaves_ticket_open(self):
+        cog = await self._make_cog()
+        cog._archive_ticket_transcript = AsyncMock(
+            side_effect=RuntimeError("transcript destination is unavailable")
+        )
+        channel = SimpleNamespace(
+            id=55,
+            name="gen-0001",
+            topic="ticket_type=general_support;ticket_owner_id=11",
+            overwrites_for=Mock(return_value=discord.PermissionOverwrite()),
+            set_permissions=AsyncMock(),
+            edit=AsyncMock(),
+        )
+        interaction = SimpleNamespace(
+            channel=channel,
+            user=SimpleNamespace(id=11),
+            message=SimpleNamespace(embeds=[discord.Embed(title="Ticket closure request")], edit=AsyncMock()),
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+
+        with patch("ticketing.discord.TextChannel", type(channel)):
+            await cog.accept_close_request(interaction, 55, 11)
+
+        channel.set_permissions.assert_not_awaited()
+        channel.edit.assert_not_awaited()
+        self.assertIn("remains open", interaction.followup.send.await_args.args[0])
+
+    async def test_staff_override_requires_confirmation_then_archives_and_closes(self):
+        cog = await self._make_cog()
+        cog._archive_ticket_transcript = AsyncMock()
+        ticket_owner = SimpleNamespace(id=11)
+        request_message = SimpleNamespace(
+            embeds=[discord.Embed(title="Ticket closure request")],
+            edit=AsyncMock(),
+        )
+        partial_message = SimpleNamespace(
+            fetch=AsyncMock(return_value=request_message),
+            edit=AsyncMock(),
+        )
+        member = SimpleNamespace(
+            id=33,
+            roles=[SimpleNamespace(name="Staff")],
+        )
+        channel = SimpleNamespace(
+            id=55,
+            name="gen-0001",
+            guild=SimpleNamespace(
+                get_member=Mock(return_value=ticket_owner),
+                fetch_member=AsyncMock(),
+            ),
+            topic="ticket_type=general_support;ticket_owner_id=11",
+            get_partial_message=Mock(return_value=partial_message),
+            overwrites_for=Mock(return_value=discord.PermissionOverwrite()),
+            set_permissions=AsyncMock(),
+            edit=AsyncMock(),
+        )
+        first_interaction = SimpleNamespace(
+            channel=channel,
+            user=member,
+            message=SimpleNamespace(id=77),
+            response=SimpleNamespace(send_message=AsyncMock()),
+        )
+
+        with patch("ticketing.discord.TextChannel", type(channel)):
+            await cog.accept_close_request(
+                first_interaction, channel_id=55, owner_id=11, request_message_id=77
+            )
+
+        first_interaction.response.send_message.assert_awaited_once()
+        confirmation_view = first_interaction.response.send_message.await_args.kwargs["view"]
+        self.assertEqual(
+            confirmation_view.children[0].label,
+            "Confirm staff override",
+        )
+        confirmation_interaction = SimpleNamespace(
+            channel=channel,
+            user=member,
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+
+        with patch("ticketing.discord.TextChannel", type(channel)):
+            await confirmation_view.children[0].callback(confirmation_interaction)
+
+        cog._archive_ticket_transcript.assert_awaited_once_with(channel)
+        channel.set_permissions.assert_awaited_once()
+        self.assertIn("ticket_status=closed", channel.edit.await_args.kwargs["topic"])
+        request_message.edit.assert_awaited_once()
+        self.assertIs(
+            channel.set_permissions.await_args.args[0],
+            ticket_owner,
+        )
+
+    async def test_transcript_zip_includes_messages_embeds_and_attachments(self):
+        cog = await self._make_cog()
+        author = SimpleNamespace(
+            id=22,
+            name="Member",
+            display_name="Member",
+        )
+        attachment = SimpleNamespace(
+            id=91,
+            filename="evidence.txt",
+            size=8,
+            read=AsyncMock(return_value=b"evidence"),
+        )
+        message = SimpleNamespace(
+            id=44,
+            author=author,
+            content="The bug happened after restart.",
+            created_at=None,
+            embeds=[discord.Embed(description="Question: Describe the bug")],
+            attachments=[attachment],
+        )
+
+        class TranscriptChannel:
+            id = 1562225728651657337
+            guild = SimpleNamespace(id=123)
+            category_id = 1522884583471714324
+            send = AsyncMock(return_value=SimpleNamespace(id=90))
+
+        transcript_channel = TranscriptChannel()
+
+        class Guild:
+            id = 123
+            name = "Test Guild"
+            filesize_limit = 8_000_000
+
+            def get_channel(self, channel_id):
+                return transcript_channel
+
+        class TicketChannel:
+            id = 55
+            name = "bug-0001"
+            guild = Guild()
+
+            async def history(self, limit, oldest_first):
+                yield message
+
+        with patch("ticketing.discord.TextChannel", (TranscriptChannel, TicketChannel)):
+            await cog._archive_ticket_transcript(TicketChannel())
+
+        archive_file = transcript_channel.send.await_args.kwargs["file"]
+        archive_file.fp.seek(0)
+        with zipfile.ZipFile(io.BytesIO(archive_file.fp.read())) as archive:
+            transcript = archive.read("transcript.txt").decode("utf-8")
+            self.assertIn("The bug happened after restart.", transcript)
+            self.assertIn("Question: Describe the bug", transcript)
+            self.assertIn("attachments/44/91-evidence.txt", archive.namelist())
+            self.assertEqual(
+                archive.read("attachments/44/91-evidence.txt"), b"evidence"
+            )
 
     async def test_only_ticket_opener_can_accept_close_request(self):
         cog = await self._make_cog()

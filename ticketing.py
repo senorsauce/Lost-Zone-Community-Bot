@@ -3,6 +3,7 @@ import io
 import logging
 import os
 import re
+import zipfile
 from typing import Any
 
 import discord
@@ -15,6 +16,8 @@ logger = logging.getLogger(__name__)
 PANEL_FOOTER = "STALKER: Lost Zone Ticket Bot - Stalker Support"
 LEGACY_PANEL_FOOTER = "zvtbot-ticket-panel-v1"
 CLOSE_REQUEST_FOOTER = "ticket-close-request-v1"
+DEFAULT_TRANSCRIPT_CHANNEL_ID = 1562225728651657337
+DEFAULT_TRANSCRIPT_CATEGORY_ID = 1522884583471714324
 ALLOWED_FILE_EXTENSIONS = {".jpg", ".png", ".json", ".zip", ".txt", ".mp3", ".mp4"}
 EVIDENCE_ACKNOWLEDGMENT = (
     "Do you understand that without providing evidence of the situation, that "
@@ -468,7 +471,53 @@ class CloseRequestButton(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction) -> None:
         await self.cog.accept_close_request(
-            interaction, self.channel_id, self.owner_id
+            interaction,
+            self.channel_id,
+            self.owner_id,
+            interaction.message.id,
+        )
+
+
+class StaffCloseOverrideView(discord.ui.View):
+    def __init__(
+        self,
+        cog: "TicketingCog",
+        channel_id: int,
+        owner_id: int,
+        request_message_id: int,
+    ):
+        super().__init__(timeout=180)
+        self.add_item(
+            StaffCloseOverrideButton(
+                cog, channel_id, owner_id, request_message_id
+            )
+        )
+
+
+class StaffCloseOverrideButton(discord.ui.Button):
+    def __init__(
+        self,
+        cog: "TicketingCog",
+        channel_id: int,
+        owner_id: int,
+        request_message_id: int,
+    ):
+        super().__init__(
+            label="Confirm staff override",
+            style=discord.ButtonStyle.danger,
+        )
+        self.cog = cog
+        self.channel_id = channel_id
+        self.owner_id = owner_id
+        self.request_message_id = request_message_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await self.cog.accept_close_request(
+            interaction,
+            self.channel_id,
+            self.owner_id,
+            self.request_message_id,
+            staff_override_confirmed=True,
         )
 
 
@@ -528,6 +577,18 @@ class TicketingCog(commands.Cog):
         self._global_username_checked = False
         self.state_path = os.getenv("TICKET_STATE_PATH", "ticket_state.json")
         self.bot_nickname = os.getenv("BOT_NICKNAME", "STALKER: Lost Zone")
+        self.transcript_channel_id = int(
+            os.getenv(
+                "TICKET_TRANSCRIPT_CHANNEL_ID",
+                str(DEFAULT_TRANSCRIPT_CHANNEL_ID),
+            )
+        )
+        self.transcript_category_id = int(
+            os.getenv(
+                "TICKET_TRANSCRIPT_CATEGORY_ID",
+                str(DEFAULT_TRANSCRIPT_CATEGORY_ID),
+            )
+        )
         self._close_request_views_registered = False
         self.state = self._load_state()
         if self.state.get("ticket_types_version", 1) < 7:
@@ -619,6 +680,127 @@ class TicketingCog(commands.Cog):
             )
             return None
         return channel
+
+    async def _get_transcript_channel(
+        self, guild: discord.Guild
+    ) -> discord.TextChannel | None:
+        channel = guild.get_channel(self.transcript_channel_id)
+        if channel is None:
+            try:
+                channel = await guild.fetch_channel(self.transcript_channel_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
+                logger.error(
+                    "Could not fetch transcript channel %s in guild %s: %s",
+                    self.transcript_channel_id,
+                    guild.id,
+                    exc,
+                )
+                return None
+        if not isinstance(channel, discord.TextChannel):
+            logger.error(
+                "Transcript channel %s is not a text channel.",
+                self.transcript_channel_id,
+            )
+            return None
+        if channel.guild.id != guild.id:
+            logger.error(
+                "Transcript channel %s is not in ticket guild %s.",
+                channel.id,
+                guild.id,
+            )
+            return None
+        if channel.category_id != self.transcript_category_id:
+            logger.error(
+                "Transcript channel %s is not in configured category %s.",
+                channel.id,
+                self.transcript_category_id,
+            )
+            return None
+        return channel
+
+    async def _archive_ticket_transcript(
+        self, ticket_channel: discord.TextChannel
+    ) -> discord.Message:
+        transcript_channel = await self._get_transcript_channel(ticket_channel.guild)
+        if transcript_channel is None:
+            raise RuntimeError(
+                "Transcript channel is missing, inaccessible, or in the wrong category."
+            )
+
+        transcript_lines = [
+            f"Ticket transcript: #{ticket_channel.name} ({ticket_channel.id})",
+            f"Guild: {ticket_channel.guild.name} ({ticket_channel.guild.id})",
+            "",
+        ]
+        attachments: list[tuple[str, bytes]] = []
+        message_count = 0
+        async for message in ticket_channel.history(limit=None, oldest_first=True):
+            message_count += 1
+            created_at = getattr(message, "created_at", None)
+            timestamp = created_at.isoformat() if created_at is not None else "unknown time"
+            author = getattr(message.author, "display_name", message.author.name)
+            transcript_lines.append(
+                f"[{timestamp}] {author} ({message.author.id})"
+            )
+            if message.content:
+                transcript_lines.append(message.content)
+
+            for embed in message.embeds:
+                if embed.title:
+                    transcript_lines.append(f"Embed title: {embed.title}")
+                if embed.description:
+                    transcript_lines.append(embed.description)
+                for field in embed.fields:
+                    transcript_lines.append(f"{field.name}: {field.value}")
+
+            for attachment in message.attachments:
+                safe_name = os.path.basename(attachment.filename.replace("\\", "/"))
+                if not safe_name:
+                    safe_name = f"attachment-{attachment.id}"
+                archive_path = f"attachments/{message.id}/{attachment.id}-{safe_name}"
+                try:
+                    attachment_data = await attachment.read(use_cached=True)
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
+                    raise RuntimeError(
+                        f"Could not download ticket attachment {attachment.filename}."
+                    ) from exc
+                attachments.append((archive_path, attachment_data))
+                transcript_lines.append(
+                    f"Attachment archived as {archive_path} ({attachment.size} bytes)."
+                )
+            transcript_lines.append("")
+
+        archive_buffer = io.BytesIO()
+        with zipfile.ZipFile(
+            archive_buffer, mode="w", compression=zipfile.ZIP_DEFLATED
+        ) as archive:
+            archive.writestr("transcript.txt", "\n".join(transcript_lines))
+            for archive_path, attachment_data in attachments:
+                archive.writestr(archive_path, attachment_data)
+        archive_bytes = archive_buffer.getvalue()
+        if len(archive_bytes) > ticket_channel.guild.filesize_limit:
+            raise RuntimeError(
+                "Transcript archive exceeds this server's upload size limit."
+            )
+
+        embed = discord.Embed(
+            title=f"Closed ticket transcript: #{ticket_channel.name}",
+            description=(
+                f"Ticket channel ID: {ticket_channel.id}\n"
+                f"Messages: {message_count}\n"
+                f"Files: {len(attachments)}"
+            ),
+            colour=discord.Colour(0x3C3CE8),
+        )
+        embed.set_footer(text=PANEL_FOOTER)
+        return await transcript_channel.send(
+            embed=embed,
+            file=discord.File(
+                io.BytesIO(archive_bytes),
+                filename=f"{ticket_channel.name}-{ticket_channel.id}-transcript.zip",
+            ),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
 
     async def _restore_close_request_views(self) -> None:
         if self._close_request_views_registered:
@@ -776,7 +958,7 @@ class TicketingCog(commands.Cog):
                         "Could not set bot nickname in guild %s: %s", guild.id, exc
                     )
             await self.upsert_panel(guild)
-            await self._restore_close_request_views()
+        await self._restore_close_request_views()
 
     @app_commands.command(
         name="ticketconfig",
@@ -969,43 +1151,124 @@ class TicketingCog(commands.Cog):
         interaction: discord.Interaction,
         channel_id: int,
         owner_id: int,
+        request_message_id: int | None = None,
+        staff_override_confirmed: bool = False,
     ) -> None:
         channel = interaction.channel
         if (
             channel is None
             or channel.id != channel_id
-            or interaction.user.id != owner_id
+            or not self._is_ticket_channel(channel)
         ):
             await interaction.response.send_message(
-                "Only the ticket opener can accept this close request here.",
+                "This close request is not for an open ticket in the current channel.",
                 ephemeral=True,
             )
             return
 
+        is_owner = interaction.user.id == owner_id
+        is_staff = await has_staff_role(interaction)
+        if not is_owner:
+            if not is_staff:
+                await interaction.response.send_message(
+                    "Only the ticket opener or Staff can accept this close request.",
+                    ephemeral=True,
+                )
+                return
+            if not staff_override_confirmed:
+                await interaction.response.send_message(
+                    "You did not open this ticket. Confirm that you want to close it "
+                    "as a Staff override.",
+                    view=StaffCloseOverrideView(
+                        self,
+                        channel_id,
+                        owner_id,
+                        request_message_id or interaction.message.id,
+                    ),
+                    ephemeral=True,
+                )
+                return
+
+        requester = interaction.user
+        if not is_owner:
+            requester = channel.guild.get_member(owner_id)
+            if requester is None:
+                try:
+                    requester = await channel.guild.fetch_member(owner_id)
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    requester = None
+            if requester is None:
+                await interaction.response.send_message(
+                    "I could not find the ticket opener in this server. The ticket was not closed.",
+                    ephemeral=True,
+                )
+                return
+
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
-            overwrite = channel.overwrites_for(interaction.user)
-            overwrite.view_channel = True
-            overwrite.read_message_history = True
-            overwrite.send_messages = False
-            await channel.set_permissions(
-                interaction.user,
-                overwrite=overwrite,
-                reason="Ticket close request accepted by opener",
-            )
-            topic = channel.topic or ""
-            if "ticket_status=closed" not in topic:
-                topic = f"{topic};ticket_status=closed" if topic else "ticket_status=closed"
-            await channel.edit(topic=topic)
+            if request_message_id is not None:
+                request_message = channel.get_partial_message(request_message_id)
+                request_message = await request_message.fetch()
+            else:
+                request_message = interaction.message
+            if not request_message.embeds:
+                raise RuntimeError("The close request message has no confirmation embed.")
 
-            accepted_embed = interaction.message.embeds[0].copy()
+            await self._archive_ticket_transcript(channel)
+            previous_overwrite = channel.overwrites_for(requester)
+            closed_overwrite = previous_overwrite
+            closed_overwrite.view_channel = True
+            closed_overwrite.read_message_history = True
+            closed_overwrite.send_messages = False
+            try:
+                await channel.set_permissions(
+                    requester,
+                    overwrite=closed_overwrite,
+                    reason=(
+                        "Ticket close request accepted by opener"
+                        if is_owner
+                        else f"Ticket closed by Staff override from {interaction.user}"
+                    ),
+                )
+                topic = channel.topic or ""
+                if "ticket_status=closed" not in topic:
+                    topic = (
+                        f"{topic};ticket_status=closed"
+                        if topic
+                        else "ticket_status=closed"
+                    )
+                await channel.edit(topic=topic)
+            except Exception:
+                try:
+                    await channel.set_permissions(
+                        requester,
+                        overwrite=previous_overwrite,
+                        reason="Roll back incomplete ticket closure",
+                    )
+                except Exception:
+                    logger.exception(
+                        "Could not roll back permissions after closure failure in %s.",
+                        channel.id,
+                    )
+                raise
+
+            accepted_embed = request_message.embeds[0].copy()
             accepted_embed.title = "Ticket closed"
             accepted_embed.set_footer(text=f"{PANEL_FOOTER} | closed")
-            await interaction.message.edit(embed=accepted_embed, view=None)
-        except (discord.Forbidden, discord.HTTPException, IndexError):
+            try:
+                await request_message.edit(embed=accepted_embed, view=None)
+            except (discord.Forbidden, discord.HTTPException):
+                logger.exception(
+                    "Ticket %s was closed, but close-request message %s was not updated.",
+                    channel.id,
+                    request_message.id,
+                )
+        except Exception as exc:
             logger.exception("Could not close ticket channel %s.", channel.id)
             await interaction.followup.send(
-                "I could not close this ticket. Please contact Staff.", ephemeral=True
+                "I could not save the transcript or close this ticket. It remains open. "
+                f"Details: {exc}",
+                ephemeral=True,
             )
             return
 
