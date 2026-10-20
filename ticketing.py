@@ -216,9 +216,19 @@ class TicketPanelButton(discord.ui.Button):
         self.ticket_type_key = ticket_type
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        await interaction.response.send_modal(
-            TicketSubmissionModal(self.cog, self.ticket_type_key)
-        )
+        try:
+            await interaction.response.send_modal(
+                TicketSubmissionModal(self.cog, self.ticket_type_key)
+            )
+        except Exception:
+            logger.exception(
+                "Could not open %s ticket form.", self.ticket_type_key
+            )
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "The ticket form could not be opened. Please try again.",
+                    ephemeral=True,
+                )
 
 
 class TicketSubmissionModal(discord.ui.Modal):
@@ -268,6 +278,7 @@ class TicketSubmissionModal(discord.ui.Modal):
             )
             return
 
+        await interaction.response.defer(ephemeral=True, thinking=True)
         uploads = []
         try:
             for attachment in attachments:
@@ -278,7 +289,7 @@ class TicketSubmissionModal(discord.ui.Modal):
                     }
                 )
         except (discord.HTTPException, OSError):
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "One or more uploaded files could not be read. Please try again.",
                 ephemeral=True,
             )
@@ -286,14 +297,16 @@ class TicketSubmissionModal(discord.ui.Modal):
 
         acknowledgment = TICKET_TYPES[self.ticket_type].get("acknowledgment")
         if acknowledgment:
-            await interaction.response.send_modal(
-                TicketAcknowledgmentModal(
+            await interaction.followup.send(
+                "Please confirm the evidence acknowledgment to continue.",
+                view=TicketAcknowledgmentView(
                     self.cog,
                     self.ticket_type,
                     answers,
                     acknowledgment,
                     uploads,
-                )
+                ),
+                ephemeral=True,
             )
             return
 
@@ -328,6 +341,62 @@ class TicketAcknowledgmentModal(discord.ui.Modal, title="Final Acknowledgment"):
             self.ticket_type_key,
             self.uploads,
         )
+
+
+class TicketAcknowledgmentView(discord.ui.View):
+    def __init__(
+        self,
+        cog: "TicketingCog",
+        ticket_type_key: str,
+        answers: dict[str, str],
+        acknowledgment: str,
+        uploads: list[dict[str, Any]],
+    ):
+        super().__init__(timeout=180)
+        self.add_item(
+            TicketAcknowledgmentButton(
+                cog, ticket_type_key, answers, acknowledgment, uploads
+            )
+        )
+
+
+class TicketAcknowledgmentButton(discord.ui.Button):
+    def __init__(
+        self,
+        cog: "TicketingCog",
+        ticket_type_key: str,
+        answers: dict[str, str],
+        acknowledgment: str,
+        uploads: list[dict[str, Any]],
+    ):
+        super().__init__(label="Continue", style=discord.ButtonStyle.secondary)
+        self.cog = cog
+        self.ticket_type_key = ticket_type_key
+        self.answers = answers
+        self.acknowledgment = acknowledgment
+        self.uploads = uploads
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        try:
+            await interaction.response.send_modal(
+                TicketAcknowledgmentModal(
+                    self.cog,
+                    self.ticket_type_key,
+                    self.answers,
+                    self.acknowledgment,
+                    self.uploads,
+                )
+            )
+        except Exception:
+            logger.exception(
+                "Could not open acknowledgment modal for %s.",
+                self.ticket_type_key,
+            )
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "The confirmation form could not be opened. Please try again.",
+                    ephemeral=True,
+                )
 
 
 class GeneralSupportModal(TicketSubmissionModal):
@@ -392,7 +461,10 @@ class TicketingCog(commands.Cog):
         self.category_configs = parse_ticket_category_configs(
             os.getenv("TICKET_CATEGORY_CONFIGS", "")
         )
+        self.bot_username = os.getenv("BOT_USERNAME", "STALKER_Lost_Zone")
+        self._global_username_checked = False
         self.state_path = os.getenv("TICKET_STATE_PATH", "ticket_state.json")
+        self.bot_nickname = os.getenv("BOT_NICKNAME", "STALKER: Lost Zone")
         self.state = self._load_state()
         if self.state.get("ticket_types_version", 1) < 7:
             for enabled_types in self.state["enabled_types"].values():
@@ -539,7 +611,32 @@ class TicketingCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_ready(self) -> None:
+        if not self._global_username_checked:
+            user = self.bot.user
+            if user is None or user.name == self.bot_username:
+                self._global_username_checked = True
+            else:
+                try:
+                    await user.edit(username=self.bot_username)
+                    self._global_username_checked = True
+                    logger.info("Updated global bot username to %s.", self.bot_username)
+                except (discord.Forbidden, discord.HTTPException, ValueError) as exc:
+                    logger.warning(
+                        "Could not update global bot username; change it in the Discord Developer Portal if needed: %s",
+                        exc,
+                    )
         for guild in self.bot.guilds:
+            member = guild.me
+            if member is not None and member.nick != self.bot_nickname:
+                try:
+                    await member.edit(
+                        nick=self.bot_nickname,
+                        reason="Set configured community bot nickname",
+                    )
+                except (discord.Forbidden, discord.HTTPException) as exc:
+                    logger.warning(
+                        "Could not set bot nickname in guild %s: %s", guild.id, exc
+                    )
             await self.upsert_panel(guild)
 
     @app_commands.command(
@@ -583,25 +680,20 @@ class TicketingCog(commands.Cog):
     ) -> None:
         guild = interaction.guild
         if guild is None:
-            await interaction.response.send_message(
-                "Tickets can only be created in a server.", ephemeral=True
-            )
+            await self._send_ephemeral(interaction, "Tickets can only be created in a server.")
             return
 
         config = self.guild_configs.get(str(guild.id))
         if config is None:
-            await interaction.response.send_message(
-                "Ticketing is not configured for this server.", ephemeral=True
-            )
+            await self._send_ephemeral(interaction, "Ticketing is not configured for this server.")
             return
 
         if ticket_type not in TICKET_TYPES:
-            await interaction.response.send_message(
-                "Unknown ticket type.", ephemeral=True
-            )
+            await self._send_ephemeral(interaction, "Unknown ticket type.")
             return
 
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True, thinking=True)
         ticket_type_config = TICKET_TYPES[ticket_type]
         category = None
         category_id = self.category_configs.get(str(guild.id), {}).get(ticket_type)
@@ -681,13 +773,17 @@ class TicketingCog(commands.Cog):
             )
             opening_embed = discord.Embed(
                 title=ticket_type_config["label"],
-                description=(
-                    f"{requester.mention} has opened a "
-                    f"{ticket_type_config['category_name']} ticket."
-                ),
+                        description=(
+                            f"{requester.mention} has opened a "
+                            f"{ticket_type_config['label']} ticket.\n"
+                        ),
                 colour=discord.Colour(0x3C3CE8),
             )
-            display_name = getattr(requester, "display_name", requester.name)
+            display_name = getattr(
+                requester,
+                "display_name",
+                getattr(requester, "name", str(requester)),
+            )
             avatar = getattr(requester, "display_avatar", None)
             opening_embed.set_author(
                 name=display_name,
@@ -697,33 +793,60 @@ class TicketingCog(commands.Cog):
             for question in ticket_type_config["questions"]:
                 answer = answers.get(question["label"], "")
                 opening_embed.add_field(
-                    name=question.get("answer_label", question["label"]),
-                    value=f"*{answer}*",
+                    name=question["label"],
+                    value=answer or "N/A",
                     inline=False,
                 )
             if acknowledgment := ticket_type_config.get("acknowledgment"):
                 opening_embed.add_field(
                     name=acknowledgment,
-                    value=f"*{answers.get(acknowledgment, '')}*",
+                    value=answers.get(acknowledgment, "") or "N/A",
                     inline=False,
                 )
-            files = [
-                discord.File(io.BytesIO(upload["data"]), filename=upload["filename"])
-                for upload in uploads
-            ]
-            staff_text = "\n@ Support Staff" if ticket_type == "general_support" else ""
-            await channel.send(
-                content=(
-                    f"{requester.mention} - Thank you for opening a ticket. "
-                    "Please be patient while staff gets to your issue."
-                    f"{staff_text}"
-                ),
-                embed=opening_embed,
-                files=files,
-            )
+            if ticket_type == "whitelist_submission":
+                opening_content = (
+                    f"Welcome to STALKER: Lost Zone, {requester.mention}! "
+                    "Your whitelist has been received, and the answers have been "
+                    "posted below for Staff review. Any corrections that need to "
+                    "be made by you will be requested here.\n\n"
+                    "Please be patient, thank you!"
+                )
+            else:
+                opening_content = (
+                    f"Hello {requester.mention} -- You have opened a "
+                    f"{ticket_type_config['label']} ticket. Please be patient "
+                    "while staff addresses your issue."
+                )
+            await channel.send(content=opening_content, embed=opening_embed)
         except (discord.Forbidden, discord.HTTPException):
+            logger.exception("Could not create or post the opening ticket message.")
             await interaction.followup.send(
                 "I could not create the ticket channel. Check my channel permissions.",
+                ephemeral=True,
+            )
+            return
+
+        failed_uploads = []
+        for upload in uploads:
+            try:
+                await channel.send(
+                    file=discord.File(
+                        io.BytesIO(upload["data"]), filename=upload["filename"]
+                    )
+                )
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                logger.exception(
+                    "Could not attach uploaded file %s to ticket channel %s.",
+                    upload["filename"],
+                    channel.id,
+                )
+                failed_uploads.append(upload["filename"])
+
+        if failed_uploads:
+            await interaction.followup.send(
+                "Ticket created, but these files could not be attached: "
+                + ", ".join(failed_uploads)
+                + ". They may exceed the server's upload limit.",
                 ephemeral=True,
             )
             return
@@ -731,3 +854,10 @@ class TicketingCog(commands.Cog):
         await interaction.followup.send(
             f"Your ticket is ready: {channel.mention}", ephemeral=True
         )
+
+    @staticmethod
+    async def _send_ephemeral(interaction: discord.Interaction, content: str) -> None:
+        if interaction.response.is_done():
+            await interaction.followup.send(content, ephemeral=True)
+        else:
+            await interaction.response.send_message(content, ephemeral=True)

@@ -1,3 +1,4 @@
+import json
 import os
 import unittest
 from types import SimpleNamespace
@@ -7,9 +8,14 @@ import discord
 
 from ticketing import (
     BugReportModal,
+    EVIDENCE_ACKNOWLEDGMENT,
     GeneralSupportModal,
+    TicketAcknowledgmentModal,
+    TicketAcknowledgmentView,
+    TicketSubmissionModal,
     TicketPanelView,
     TicketingCog,
+    TICKET_TYPES,
     parse_ticket_category_configs,
     parse_ticket_guild_configs,
     validate_upload_extension,
@@ -66,26 +72,57 @@ class TicketUploadTests(unittest.TestCase):
                 self.assertFalse(validate_upload_extension(filename))
 
 
+class TicketSubmissionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_upload_submission_is_deferred_before_file_read(self):
+        cog = SimpleNamespace(finish_ticket_submission=AsyncMock())
+        modal = TicketSubmissionModal(cog, "general_support")
+        modal.question_fields[0][1]._value = "Issue details"
+        response = SimpleNamespace(
+            defer=AsyncMock(),
+            send_message=AsyncMock(),
+        )
+        attachment = SimpleNamespace(filename="evidence.txt")
+
+        async def read_attachment():
+            self.assertEqual(response.defer.await_count, 1)
+            return b"evidence"
+
+        attachment.read = AsyncMock(side_effect=read_attachment)
+        modal.upload_field.component._values = [attachment]
+        interaction = SimpleNamespace(
+            response=response,
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+
+        await modal.on_submit(interaction)
+
+        cog.finish_ticket_submission.assert_awaited_once_with(
+            interaction,
+            {"Describe your issue:": "Issue details"},
+            "general_support",
+            [{"original_name": "evidence.txt", "data": b"evidence"}],
+        )
+
+
 class TicketCreationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_ticket_uses_category_and_sends_answers_with_uploads(self):
+    async def _make_cog(self, ticket_categories):
         with patch.dict(
             os.environ,
             {
-                "TICKET_GUILD_CONFIGS": (
-                    '{"123": {"channel_id": 456}}'
-                ),
-                "TICKET_CATEGORY_CONFIGS": '{"123": {"bug_report": 789}}',
+                "TICKET_GUILD_CONFIGS": '{"123": {"channel_id": 456}}',
+                "TICKET_CATEGORY_CONFIGS": json.dumps({"123": ticket_categories}),
                 "TICKET_STATE_PATH": os.devnull,
             },
         ):
-            cog = TicketingCog(SimpleNamespace())
+            return TicketingCog(SimpleNamespace())
 
+    async def _submit_ticket(self, cog, ticket_type, answers, uploads):
         class Category:
             overwrites = {}
 
         category = Category()
         ticket_channel = SimpleNamespace(
-            mention="#bug-0001",
+            mention=f"#{TICKET_TYPES[ticket_type]['channel_prefix']}-0001",
             send=AsyncMock(),
         )
         guild = SimpleNamespace(
@@ -99,31 +136,186 @@ class TicketCreationTests(unittest.IsolatedAsyncioTestCase):
         interaction = SimpleNamespace(
             guild=guild,
             user=Mock(mention="<@42>"),
-            response=SimpleNamespace(defer=AsyncMock()),
+            response=SimpleNamespace(
+                defer=AsyncMock(),
+                is_done=Mock(return_value=False),
+            ),
             followup=SimpleNamespace(send=AsyncMock()),
         )
 
         with patch("ticketing.discord.CategoryChannel", Category):
             await cog.create_ticket(
                 interaction,
-                {"How did this bug first occur?": "After restart"},
-                "bug_report",
-                [{"filename": "crash.txt", "data": b"log data"}],
+                answers,
+                ticket_type,
+                uploads,
             )
+
+        return guild, category, ticket_channel, interaction
+
+    async def test_ticket_uses_category_and_sends_answers_with_uploads(self):
+        cog = await self._make_cog({"bug_report": 789})
+        guild, category, ticket_channel, _ = await self._submit_ticket(
+            cog,
+            "bug_report",
+            {"How did this bug first occur?": "After restart"},
+            [{"filename": "crash.txt", "data": b"log data"}],
+        )
 
         create_kwargs = guild.create_text_channel.await_args.kwargs
         self.assertEqual(create_kwargs["name"], "bug-0001")
         self.assertIs(create_kwargs["category"], category)
-        send_kwargs = ticket_channel.send.await_args.kwargs
-        self.assertEqual(send_kwargs["embed"].fields[0].name, "How did this bug first occur?")
-        self.assertEqual(send_kwargs["embed"].fields[0].value, "*After restart*")
-        self.assertEqual([upload.filename for upload in send_kwargs["files"]], ["crash.txt"])
-        self.assertEqual(send_kwargs["files"][0].fp.read(), b"log data")
-        self.assertEqual(send_kwargs["embed"].footer.text, "STALKER: Lost Zone Ticket Bot - Stalker Support")
-        self.assertTrue(send_kwargs["embed"].title)
+        opening_message, upload_message = ticket_channel.send.await_args_list
+        opening_kwargs = opening_message.kwargs
+        upload_kwargs = upload_message.kwargs
+        self.assertEqual(
+            opening_kwargs["content"],
+            "Hello <@42> -- You have opened a Bug Report ticket. "
+            "Please be patient while staff addresses your issue.",
+        )
+        embed = opening_kwargs["embed"]
+        self.assertEqual(embed.fields[0].name, "How did this bug first occur?")
+        self.assertEqual(embed.fields[0].value, "After restart")
+        self.assertEqual(embed.footer.text, "STALKER: Lost Zone Ticket Bot - Stalker Support")
+        self.assertTrue(embed.title)
+        self.assertEqual(upload_kwargs["file"].filename, "crash.txt")
+        self.assertEqual(upload_kwargs["file"].fp.read(), b"log data")
+
+    async def test_all_non_whitelist_types_use_the_requested_greeting_and_embed(self):
+        for ticket_type, config in TICKET_TYPES.items():
+            if ticket_type == "whitelist_submission":
+                continue
+            with self.subTest(ticket_type=ticket_type):
+                cog = await self._make_cog({ticket_type: 789})
+                answers = {
+                    question["label"]: "Answer"
+                    for question in config["questions"]
+                }
+                if config.get("acknowledgment"):
+                    answers[config["acknowledgment"]] = "Yes"
+                _, _, ticket_channel, _ = await self._submit_ticket(
+                    cog, ticket_type, answers, []
+                )
+
+                opening_kwargs = ticket_channel.send.await_args.kwargs
+                self.assertEqual(
+                    opening_kwargs["content"],
+                    f"Hello <@42> -- You have opened a {config['label']} ticket. "
+                    "Please be patient while staff addresses your issue.",
+                )
+                embed = opening_kwargs["embed"]
+                self.assertEqual(
+                    embed.description,
+                    f"<@42> has opened a {config['label']} ticket.\n",
+                )
+                self.assertEqual(
+                    [field.name for field in embed.fields[:len(config["questions"])]],
+                    [question["label"] for question in config["questions"]],
+                )
+
+    async def test_whitelist_uses_its_custom_greeting(self):
+        cog = await self._make_cog({"whitelist_submission": 789})
+        _, _, ticket_channel, _ = await self._submit_ticket(
+            cog,
+            "whitelist_submission",
+            {"What is your Character's Name?": "Stalker"},
+            [],
+        )
+
+        opening_kwargs = ticket_channel.send.await_args.kwargs
+        self.assertEqual(
+            opening_kwargs["content"],
+            "Welcome to STALKER: Lost Zone, <@42>! Your whitelist has been "
+            "received, and the answers have been posted below for Staff review. "
+            "Any corrections that need to be made by you will be requested here.\n\n"
+            "Please be patient, thank you!",
+        )
+        self.assertEqual(
+            opening_kwargs["embed"].fields[0].name,
+            "What is your Character's Name?",
+        )
 
 
 class TicketPanelStartupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_startup_sets_global_username_and_server_nickname(self):
+        bot_user = SimpleNamespace(name="ZVTBOT", edit=AsyncMock())
+        guild_member = SimpleNamespace(nick=None, edit=AsyncMock())
+        guild = SimpleNamespace(id=123, me=guild_member)
+        bot = SimpleNamespace(user=bot_user, guilds=[guild], add_view=Mock())
+
+        with patch.dict(
+            os.environ,
+            {
+                "BOT_USERNAME": "STALKER_Lost_Zone",
+                "BOT_NICKNAME": "STALKER: Lost Zone",
+                "TICKET_GUILD_CONFIGS": "",
+                "TICKET_STATE_PATH": os.devnull,
+            },
+        ):
+            cog = TicketingCog(bot)
+
+        await cog.on_ready()
+
+        bot_user.edit.assert_awaited_once_with(username="STALKER_Lost_Zone")
+        guild_member.edit.assert_awaited_once_with(
+            nick="STALKER: Lost Zone",
+            reason="Set configured community bot nickname",
+        )
+
+    async def test_every_ticket_modal_completes_or_returns_acknowledgment(self):
+        cog = SimpleNamespace(finish_ticket_submission=AsyncMock())
+
+        for ticket_type in TICKET_TYPES:
+            with self.subTest(ticket_type=ticket_type):
+                cog.finish_ticket_submission.reset_mock()
+                response = SimpleNamespace(defer=AsyncMock())
+                followup = SimpleNamespace(send=AsyncMock())
+                modal = TicketSubmissionModal(cog, ticket_type)
+
+                await modal.on_submit(
+                    SimpleNamespace(response=response, followup=followup)
+                )
+
+                response.defer.assert_awaited_once_with(
+                    ephemeral=True, thinking=True
+                )
+                if TICKET_TYPES[ticket_type].get("acknowledgment"):
+                    followup.send.assert_awaited_once()
+                    self.assertIsInstance(
+                        followup.send.await_args.kwargs["view"],
+                        TicketAcknowledgmentView,
+                    )
+                else:
+                    cog.finish_ticket_submission.assert_awaited_once()
+
+    async def test_compensation_acknowledgment_uses_followup_and_button(self):
+        cog = SimpleNamespace(finish_ticket_submission=AsyncMock())
+        modal = TicketSubmissionModal(cog, "compensation_request")
+        response = SimpleNamespace(
+            defer=AsyncMock(),
+            is_done=Mock(return_value=True),
+            send_modal=AsyncMock(),
+        )
+        followup = SimpleNamespace(send=AsyncMock())
+        interaction = SimpleNamespace(response=response, followup=followup)
+
+        await modal.on_submit(interaction)
+
+        response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
+        followup.send.assert_awaited_once()
+        acknowledgment_view = followup.send.await_args.kwargs["view"]
+        button_response = SimpleNamespace(send_modal=AsyncMock())
+        await acknowledgment_view.children[0].callback(
+            SimpleNamespace(response=button_response)
+        )
+
+        acknowledgment_modal = button_response.send_modal.await_args.args[0]
+        self.assertIsInstance(acknowledgment_modal, TicketAcknowledgmentModal)
+        self.assertEqual(
+            acknowledgment_modal.children[0].content,
+            EVIDENCE_ACKNOWLEDGMENT,
+        )
+
     async def test_every_ticket_button_opens_a_valid_upload_modal(self):
         bot = SimpleNamespace(add_view=Mock())
         with patch.dict(os.environ, {"TICKET_STATE_PATH": os.devnull}):
