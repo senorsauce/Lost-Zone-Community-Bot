@@ -461,7 +461,7 @@ class TicketingCog(commands.Cog):
         self.category_configs = parse_ticket_category_configs(
             os.getenv("TICKET_CATEGORY_CONFIGS", "")
         )
-        self.bot_username = os.getenv("BOT_USERNAME", "STALKER_Lost_Zone")
+        self.bot_username = os.getenv("BOT_USERNAME", "stalker_lost_zone")
         self._global_username_checked = False
         self.state_path = os.getenv("TICKET_STATE_PATH", "ticket_state.json")
         self.bot_nickname = os.getenv("BOT_NICKNAME", "STALKER: Lost Zone")

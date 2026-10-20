@@ -246,7 +246,7 @@ class TicketPanelStartupTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(
             os.environ,
             {
-                "BOT_USERNAME": "STALKER_Lost_Zone",
+                "BOT_USERNAME": "stalker_lost_zone",
                 "BOT_NICKNAME": "STALKER: Lost Zone",
                 "TICKET_GUILD_CONFIGS": "",
                 "TICKET_STATE_PATH": os.devnull,
@@ -256,7 +256,7 @@ class TicketPanelStartupTests(unittest.IsolatedAsyncioTestCase):
 
         await cog.on_ready()
 
-        bot_user.edit.assert_awaited_once_with(username="STALKER_Lost_Zone")
+        bot_user.edit.assert_awaited_once_with(username="stalker_lost_zone")
         guild_member.edit.assert_awaited_once_with(
             nick="STALKER: Lost Zone",
             reason="Set configured community bot nickname",
