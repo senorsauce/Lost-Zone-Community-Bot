@@ -8,6 +8,7 @@ import discord
 
 from ticketing import (
     BugReportModal,
+    CloseRequestModal,
     EVIDENCE_ACKNOWLEDGMENT,
     GeneralSupportModal,
     TicketAcknowledgmentModal,
@@ -16,6 +17,7 @@ from ticketing import (
     TicketPanelView,
     TicketingCog,
     TICKET_TYPES,
+    has_staff_role,
     parse_ticket_category_configs,
     parse_ticket_guild_configs,
     validate_upload_extension,
@@ -135,7 +137,7 @@ class TicketCreationTests(unittest.IsolatedAsyncioTestCase):
         )
         interaction = SimpleNamespace(
             guild=guild,
-            user=Mock(mention="<@42>"),
+            user=Mock(id=42, mention="<@42>"),
             response=SimpleNamespace(
                 defer=AsyncMock(),
                 is_done=Mock(return_value=False),
@@ -165,6 +167,7 @@ class TicketCreationTests(unittest.IsolatedAsyncioTestCase):
         create_kwargs = guild.create_text_channel.await_args.kwargs
         self.assertEqual(create_kwargs["name"], "bug-0001")
         self.assertIs(create_kwargs["category"], category)
+        self.assertIn("ticket_owner_id=42", create_kwargs["topic"])
         opening_message, upload_message = ticket_channel.send.await_args_list
         opening_kwargs = opening_message.kwargs
         upload_kwargs = upload_message.kwargs
@@ -412,6 +415,149 @@ class TicketPanelStartupTests(unittest.IsolatedAsyncioTestCase):
                 "Additional Comments? (Put N/A if no)",
             ],
         )
+
+
+class StaffTicketCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def _make_cog(self, bot=None):
+        with patch.dict(
+            os.environ,
+            {
+                "TICKET_GUILD_CONFIGS": "",
+                "TICKET_STATE_PATH": os.devnull,
+            },
+        ):
+            return TicketingCog(bot or SimpleNamespace(add_view=Mock()))
+
+    async def test_staff_role_gate_is_case_insensitive(self):
+        staff_interaction = SimpleNamespace(
+            user=SimpleNamespace(roles=[SimpleNamespace(name="sTaFf")])
+        )
+        other_interaction = SimpleNamespace(
+            user=SimpleNamespace(roles=[SimpleNamespace(name="Moderator")])
+        )
+
+        self.assertTrue(await has_staff_role(staff_interaction))
+        self.assertFalse(await has_staff_role(other_interaction))
+        for command in (TicketingCog.useradd, TicketingCog.userremove, TicketingCog.closerequest):
+            self.assertIn(has_staff_role, command.checks)
+
+    async def test_useradd_and_userremove_update_ticket_overwrites(self):
+        cog = await self._make_cog()
+        member = SimpleNamespace(id=22, mention="<@22>")
+
+        class Channel:
+            name = "gen-0001"
+            topic = "ticket_type=general_support;ticket_owner_id=11"
+
+            def __init__(self):
+                self.overwrite = discord.PermissionOverwrite()
+                self.set_permissions = AsyncMock()
+
+            def overwrites_for(self, target):
+                return self.overwrite
+
+        channel = Channel()
+
+        def interaction():
+            return SimpleNamespace(
+                channel=channel,
+                user=SimpleNamespace(roles=[SimpleNamespace(name="Staff")]),
+                response=SimpleNamespace(
+                    is_done=Mock(return_value=False), send_message=AsyncMock()
+                ),
+                followup=SimpleNamespace(send=AsyncMock()),
+            )
+
+        with patch("ticketing.discord.TextChannel", Channel):
+            await TicketingCog.useradd.callback(cog, interaction(), member)
+            self.assertTrue(channel.overwrite.view_channel)
+            self.assertTrue(channel.overwrite.send_messages)
+            self.assertTrue(channel.overwrite.read_message_history)
+            await TicketingCog.userremove.callback(cog, interaction(), member)
+
+        self.assertEqual(channel.set_permissions.await_count, 2)
+        removed_overwrite = channel.set_permissions.await_args.kwargs["overwrite"]
+        self.assertFalse(removed_overwrite.view_channel)
+        self.assertFalse(removed_overwrite.send_messages)
+
+    async def test_close_request_posts_named_owner_staff_reason_and_button(self):
+        bot = SimpleNamespace(add_view=Mock())
+        cog = await self._make_cog(bot)
+
+        class Channel:
+            id = 55
+            name = "cmp-0001"
+            topic = "ticket_type=compensation_request;ticket_owner_id=11"
+            guild = SimpleNamespace(
+                roles=[SimpleNamespace(name="Staff", mention="<@&33>")]
+            )
+            send = AsyncMock(return_value=SimpleNamespace(id=88))
+
+        channel = Channel()
+        interaction = SimpleNamespace(
+            channel=channel,
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+
+        with patch("ticketing.discord.TextChannel", Channel):
+            await cog.post_close_request(interaction, "No longer needed")
+
+        send_kwargs = channel.send.await_args.kwargs
+        self.assertEqual(
+            send_kwargs["embed"].description,
+            "<@11>, <@&33> has requested to close this ticket with reason : "
+            "No longer needed. Click below to accept.",
+        )
+        self.assertEqual(send_kwargs["view"].children[0].label, "Accept")
+        bot.add_view.assert_called_once_with(send_kwargs["view"], message_id=88)
+        self.assertEqual(CloseRequestModal(cog).reason.text, "Reason for closing")
+
+    async def test_accepting_close_request_locks_ticket_but_preserves_history(self):
+        cog = await self._make_cog()
+        channel = SimpleNamespace(
+            id=55,
+            topic="ticket_type=general_support;ticket_owner_id=11",
+            overwrites_for=Mock(return_value=discord.PermissionOverwrite()),
+            set_permissions=AsyncMock(),
+            edit=AsyncMock(),
+        )
+        request_message = SimpleNamespace(
+            embeds=[discord.Embed(title="Ticket closure request")],
+            edit=AsyncMock(),
+        )
+        interaction = SimpleNamespace(
+            channel=channel,
+            user=SimpleNamespace(id=11),
+            message=request_message,
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+
+        await cog.accept_close_request(interaction, 55, 11)
+
+        overwrite = channel.set_permissions.await_args.kwargs["overwrite"]
+        self.assertTrue(overwrite.view_channel)
+        self.assertTrue(overwrite.read_message_history)
+        self.assertFalse(overwrite.send_messages)
+        self.assertIn("ticket_status=closed", channel.edit.await_args.kwargs["topic"])
+        request_message.edit.assert_awaited_once()
+        self.assertIsNone(request_message.edit.await_args.kwargs["view"])
+
+    async def test_only_ticket_opener_can_accept_close_request(self):
+        cog = await self._make_cog()
+        channel = SimpleNamespace(id=55)
+        response = SimpleNamespace(send_message=AsyncMock())
+        interaction = SimpleNamespace(
+            channel=channel,
+            user=SimpleNamespace(id=99),
+            response=response,
+        )
+
+        await cog.accept_close_request(interaction, channel_id=55, owner_id=11)
+
+        response.send_message.assert_awaited_once()
+        self.assertFalse(hasattr(channel, "set_permissions"))
 
 
 if __name__ == "__main__":

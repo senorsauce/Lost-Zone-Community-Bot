@@ -2,6 +2,7 @@ import json
 import io
 import logging
 import os
+import re
 from typing import Any
 
 import discord
@@ -13,6 +14,7 @@ logger = logging.getLogger(__name__)
 
 PANEL_FOOTER = "STALKER: Lost Zone Ticket Bot - Stalker Support"
 LEGACY_PANEL_FOOTER = "zvtbot-ticket-panel-v1"
+CLOSE_REQUEST_FOOTER = "ticket-close-request-v1"
 ALLOWED_FILE_EXTENSIONS = {".jpg", ".png", ".json", ".zip", ".txt", ".mp3", ".mp4"}
 EVIDENCE_ACKNOWLEDGMENT = (
     "Do you understand that without providing evidence of the situation, that "
@@ -142,6 +144,11 @@ def split_modal_label(label: str, max_length: int = 45) -> tuple[str, str | None
     if split_at <= 0:
         split_at = max_length
     return label[:split_at], label[split_at:].lstrip()
+
+
+async def has_staff_role(interaction: discord.Interaction) -> bool:
+    roles = getattr(interaction.user, "roles", ())
+    return any(role.name.casefold() == "staff" for role in roles)
 
 
 def parse_ticket_guild_configs(raw: str) -> dict[str, dict[str, int]]:
@@ -425,6 +432,46 @@ class BugReportModal(TicketSubmissionModal):
         super().__init__(cog, "bug_report")
 
 
+class CloseRequestModal(discord.ui.Modal, title="Request Ticket Closure"):
+    reason = discord.ui.Label(
+        text="Reason for closing",
+        component=discord.ui.TextInput(
+            style=discord.TextStyle.paragraph,
+            max_length=1000,
+        ),
+    )
+
+    def __init__(self, cog: "TicketingCog"):
+        super().__init__()
+        self.cog = cog
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await self.cog.post_close_request(interaction, self.reason.component.value)
+
+
+class CloseRequestView(discord.ui.View):
+    def __init__(self, cog: "TicketingCog", channel_id: int, owner_id: int):
+        super().__init__(timeout=None)
+        self.add_item(CloseRequestButton(cog, channel_id, owner_id))
+
+
+class CloseRequestButton(discord.ui.Button):
+    def __init__(self, cog: "TicketingCog", channel_id: int, owner_id: int):
+        super().__init__(
+            label="Accept",
+            style=discord.ButtonStyle.success,
+            custom_id=f"ticket-close-accept:{channel_id}:{owner_id}",
+        )
+        self.cog = cog
+        self.channel_id = channel_id
+        self.owner_id = owner_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await self.cog.accept_close_request(
+            interaction, self.channel_id, self.owner_id
+        )
+
+
 class TicketConfigView(discord.ui.View):
     def __init__(self, cog: "TicketingCog", guild_id: int):
         super().__init__(timeout=180)
@@ -481,6 +528,7 @@ class TicketingCog(commands.Cog):
         self._global_username_checked = False
         self.state_path = os.getenv("TICKET_STATE_PATH", "ticket_state.json")
         self.bot_nickname = os.getenv("BOT_NICKNAME", "STALKER: Lost Zone")
+        self._close_request_views_registered = False
         self.state = self._load_state()
         if self.state.get("ticket_types_version", 1) < 7:
             for enabled_types in self.state["enabled_types"].values():
@@ -524,6 +572,80 @@ class TicketingCog(commands.Cog):
             key for key in enabled_types if key in TICKET_TYPES
         ]
         self._save_state()
+
+    def _is_ticket_channel(self, channel: Any) -> bool:
+        if not isinstance(channel, discord.TextChannel):
+            return False
+        if "ticket_status=closed" in (channel.topic or ""):
+            return False
+        return any(
+            channel.name.startswith(f"{ticket_type['channel_prefix']}-")
+            for ticket_type in TICKET_TYPES.values()
+        )
+
+    async def _resolve_ticket_owner_id(self, channel: discord.TextChannel) -> int | None:
+        topic = channel.topic or ""
+        owner_match = re.search(r"(?:^|;)ticket_owner_id=(\d+)(?:;|$)", topic)
+        if owner_match:
+            return int(owner_match.group(1))
+
+        try:
+            async for message in channel.history(limit=25, oldest_first=True):
+                if message.author == self.bot.user:
+                    mentioned_users = getattr(message, "mentions", [])
+                    if mentioned_users:
+                        return mentioned_users[0].id
+                    for content in [message.content] + [
+                        embed.description or "" for embed in message.embeds
+                    ]:
+                        mention = re.search(r"<@!?(\d+)>", content or "")
+                        if mention:
+                            return int(mention.group(1))
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            logger.warning(
+                "Could not resolve ticket owner from channel %s history: %s",
+                channel.id,
+                exc,
+            )
+        return None
+
+    async def _ticket_command_channel(
+        self, interaction: discord.Interaction
+    ) -> discord.TextChannel | None:
+        channel = interaction.channel
+        if not self._is_ticket_channel(channel):
+            await self._send_ephemeral(
+                interaction, "Use this command inside an open ticket channel."
+            )
+            return None
+        return channel
+
+    async def _restore_close_request_views(self) -> None:
+        if self._close_request_views_registered:
+            return
+        self._close_request_views_registered = True
+        for guild in self.bot.guilds:
+            for channel in getattr(guild, "text_channels", []):
+                if not self._is_ticket_channel(channel):
+                    continue
+                try:
+                    async for message in channel.history(limit=50):
+                        if (
+                            message.author == self.bot.user
+                            and message.embeds
+                            and CLOSE_REQUEST_FOOTER
+                            in (message.embeds[0].footer.text or "")
+                        ):
+                            owner_id = await self._resolve_ticket_owner_id(channel)
+                            if owner_id is not None:
+                                view = CloseRequestView(self, channel.id, owner_id)
+                                self.bot.add_view(view, message_id=message.id)
+                except (discord.Forbidden, discord.HTTPException) as exc:
+                    logger.warning(
+                        "Could not restore close-request buttons in channel %s: %s",
+                        channel.id,
+                        exc,
+                    )
 
     async def _configured_channel(self, guild: discord.Guild):
         config = self.guild_configs.get(str(guild.id))
@@ -654,6 +776,7 @@ class TicketingCog(commands.Cog):
                         "Could not set bot nickname in guild %s: %s", guild.id, exc
                     )
             await self.upsert_panel(guild)
+            await self._restore_close_request_views()
 
     @app_commands.command(
         name="ticketconfig",
@@ -677,6 +800,216 @@ class TicketingCog(commands.Cog):
             view=TicketConfigView(self, interaction.guild.id),
             ephemeral=True,
         )
+
+    async def cog_app_command_error(
+        self, interaction: discord.Interaction, error: app_commands.AppCommandError
+    ) -> None:
+        if isinstance(error, app_commands.CheckFailure):
+            await self._send_ephemeral(
+                interaction, "These ticket commands are only available to Staff."
+            )
+            return
+        logger.error(
+            "Ticket app command failed: %s",
+            error,
+            exc_info=(type(error), error, error.__traceback__),
+        )
+        await self._send_ephemeral(
+            interaction, "The ticket command failed. Please try again."
+        )
+
+    @app_commands.command(
+        name="useradd", description="Add a server member to this ticket"
+    )
+    @app_commands.guild_only()
+    @app_commands.check(has_staff_role)
+    @app_commands.describe(user="Server member to add to this ticket")
+    async def useradd(
+        self, interaction: discord.Interaction, user: discord.Member
+    ) -> None:
+        channel = await self._ticket_command_channel(interaction)
+        if channel is None:
+            return
+        overwrite = channel.overwrites_for(user)
+        overwrite.view_channel = True
+        overwrite.send_messages = True
+        overwrite.read_message_history = True
+        try:
+            await channel.set_permissions(
+                user,
+                overwrite=overwrite,
+                reason=f"Added to ticket by {interaction.user}",
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception(
+                "Could not add member %s to ticket channel %s.", user.id, channel.id
+            )
+            await self._send_ephemeral(
+                interaction, "I could not add that member to this ticket."
+            )
+            return
+        await self._send_ephemeral(
+            interaction, f"Added {user.mention} to this ticket."
+        )
+
+    @app_commands.command(
+        name="userremove", description="Remove a server member from this ticket"
+    )
+    @app_commands.guild_only()
+    @app_commands.check(has_staff_role)
+    @app_commands.describe(user="Server member to remove from this ticket")
+    async def userremove(
+        self, interaction: discord.Interaction, user: discord.Member
+    ) -> None:
+        channel = await self._ticket_command_channel(interaction)
+        if channel is None:
+            return
+        try:
+            await channel.set_permissions(
+                user,
+                overwrite=discord.PermissionOverwrite(
+                    view_channel=False,
+                    send_messages=False,
+                    read_message_history=False,
+                ),
+                reason=f"Removed from ticket by {interaction.user}",
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception(
+                "Could not remove member %s from ticket channel %s.",
+                user.id,
+                channel.id,
+            )
+            await self._send_ephemeral(
+                interaction, "I could not remove that member from this ticket."
+            )
+            return
+        await self._send_ephemeral(
+            interaction, f"Removed {user.mention} from this ticket."
+        )
+
+    @app_commands.command(
+        name="closerequest", description="Request that the ticket owner close this ticket"
+    )
+    @app_commands.guild_only()
+    @app_commands.check(has_staff_role)
+    async def closerequest(self, interaction: discord.Interaction) -> None:
+        channel = await self._ticket_command_channel(interaction)
+        if channel is None:
+            return
+        try:
+            await interaction.response.send_modal(CloseRequestModal(self))
+        except (discord.HTTPException, ValueError):
+            logger.exception(
+                "Could not open ticket close request modal in channel %s.", channel.id
+            )
+            await self._send_ephemeral(
+                interaction, "The close request form could not be opened. Please try again."
+            )
+
+    async def post_close_request(
+        self, interaction: discord.Interaction, reason: str
+    ) -> None:
+        channel = interaction.channel
+        if not self._is_ticket_channel(channel):
+            await self._send_ephemeral(
+                interaction, "This channel is not an open ticket."
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        owner_id = await self._resolve_ticket_owner_id(channel)
+        if owner_id is None:
+            await interaction.followup.send(
+                "I could not determine who opened this ticket, so I cannot create a close request.",
+                ephemeral=True,
+            )
+            return
+
+        staff_role = discord.utils.find(
+            lambda role: role.name.casefold() == "staff", channel.guild.roles
+        )
+        if staff_role is None:
+            await interaction.followup.send(
+                "This server does not have a Staff role to mention.", ephemeral=True
+            )
+            return
+
+        embed = discord.Embed(
+            title="Ticket closure request",
+            description=(
+                f"<@{owner_id}>, {staff_role.mention} has requested to close this "
+                f"ticket with reason : {reason}. Click below to accept."
+            ),
+            colour=discord.Colour(0x3C3CE8),
+        )
+        embed.set_footer(text=f"{PANEL_FOOTER} | {CLOSE_REQUEST_FOOTER}")
+        view = CloseRequestView(self, channel.id, owner_id)
+        try:
+            message = await channel.send(
+                embed=embed,
+                view=view,
+                allowed_mentions=discord.AllowedMentions(users=True, roles=True),
+            )
+            self.bot.add_view(view, message_id=message.id)
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception(
+                "Could not post close request to ticket channel %s.", channel.id
+            )
+            await interaction.followup.send(
+                "I could not post the close request in this ticket.", ephemeral=True
+            )
+            return
+
+        await interaction.followup.send(
+            "Close request posted in this ticket.", ephemeral=True
+        )
+
+    async def accept_close_request(
+        self,
+        interaction: discord.Interaction,
+        channel_id: int,
+        owner_id: int,
+    ) -> None:
+        channel = interaction.channel
+        if (
+            channel is None
+            or channel.id != channel_id
+            or interaction.user.id != owner_id
+        ):
+            await interaction.response.send_message(
+                "Only the ticket opener can accept this close request here.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            overwrite = channel.overwrites_for(interaction.user)
+            overwrite.view_channel = True
+            overwrite.read_message_history = True
+            overwrite.send_messages = False
+            await channel.set_permissions(
+                interaction.user,
+                overwrite=overwrite,
+                reason="Ticket close request accepted by opener",
+            )
+            topic = channel.topic or ""
+            if "ticket_status=closed" not in topic:
+                topic = f"{topic};ticket_status=closed" if topic else "ticket_status=closed"
+            await channel.edit(topic=topic)
+
+            accepted_embed = interaction.message.embeds[0].copy()
+            accepted_embed.title = "Ticket closed"
+            accepted_embed.set_footer(text=f"{PANEL_FOOTER} | closed")
+            await interaction.message.edit(embed=accepted_embed, view=None)
+        except (discord.Forbidden, discord.HTTPException, IndexError):
+            logger.exception("Could not close ticket channel %s.", channel.id)
+            await interaction.followup.send(
+                "I could not close this ticket. Please contact Staff.", ephemeral=True
+            )
+            return
+
+        await interaction.followup.send("Ticket closed. You can still read its history.", ephemeral=True)
 
     async def finish_ticket_submission(
         self,
@@ -784,6 +1117,7 @@ class TicketingCog(commands.Cog):
             channel = await guild.create_text_channel(
                 name=f"{ticket_type_config['channel_prefix']}-{ticket_number:04d}",
                 category=category,
+                topic=f"ticket_type={ticket_type};ticket_owner_id={requester.id}",
                 overwrites=overwrites,
                 reason=f"{ticket_type_config['label']} ticket created",
             )
