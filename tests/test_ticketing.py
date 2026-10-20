@@ -1,25 +1,22 @@
 import os
-import json
-import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
+import discord
+
 from ticketing import (
-    EVIDENCE_ACKNOWLEDGMENT,
+    BugReportModal,
     GeneralSupportModal,
-    TicketAcknowledgmentModal,
     TicketPanelView,
-    TicketSubmissionModal,
     TicketingCog,
-    WhitelistSubmissionModal,
-    parse_ticket_category_configs,
+    prepare_named_uploads,
     parse_ticket_guild_configs,
 )
 
 
 class TicketGuildConfigTests(unittest.TestCase):
-    def test_parses_per_guild_panel_channels(self):
+    def test_parses_per_guild_channel_and_optional_category(self):
         configs = parse_ticket_guild_configs(
             '{"123": {"channel_id": "456", "category_id": "789"}, '
             '"234": {"channel_id": 567}}'
@@ -27,30 +24,7 @@ class TicketGuildConfigTests(unittest.TestCase):
 
         self.assertEqual(
             configs,
-            {"123": {"channel_id": 456}, "234": {"channel_id": 567}},
-        )
-
-    def test_parses_ticket_categories_independently_per_guild(self):
-        configs = parse_ticket_category_configs(
-            '{"123": {"general_support": "789", "whitelist_submission": 987, '
-            '"rulebreaks": 321, "admin_reports": 654, "bug_report": 111, '
-            '"compensation_request": 222}, '
-            '"234": {"general_support": 654}}'
-        )
-
-        self.assertEqual(
-            configs,
-            {
-                "123": {
-                    "general_support": 789,
-                    "whitelist_submission": 987,
-                    "rulebreaks": 321,
-                    "admin_reports": 654,
-                    "bug_report": 111,
-                    "compensation_request": 222,
-                },
-                "234": {"general_support": 654},
-            },
+            {"123": {"channel_id": 456, "category_id": 789}, "234": {"channel_id": 567}},
         )
 
     def test_rejects_missing_panel_channel(self):
@@ -58,41 +32,125 @@ class TicketGuildConfigTests(unittest.TestCase):
             parse_ticket_guild_configs('{"123": {"category_id": 789}}')
 
 
-class TicketPanelStartupTests(unittest.IsolatedAsyncioTestCase):
-    async def test_migration_adds_whitelist_to_existing_panel_preferences(self):
-        with tempfile.TemporaryDirectory() as directory:
-            state_path = os.path.join(directory, "ticket_state.json")
-            with open(state_path, "w", encoding="utf-8") as state_file:
-                json.dump(
-                    {
-                        "ticket_types_version": 6,
-                        "counters": {},
-                        "enabled_types": {
-                            "123": ["general_support", "whitelist_submission"]
-                        },
-                    },
-                    state_file,
-                )
-
-            with patch.dict(
-                os.environ,
-                {"TICKET_GUILD_CONFIGS": "", "TICKET_STATE_PATH": state_path},
-            ):
-                cog = TicketingCog(SimpleNamespace())
+class TicketUploadTests(unittest.TestCase):
+    def test_bug_report_has_requested_questions_and_upload_field(self):
+        modal = BugReportModal(SimpleNamespace())
 
         self.assertEqual(
-            cog.get_enabled_types(123),
+            [item.text for item in modal.children[:-1]],
             [
-                "general_support",
-                "whitelist_submission",
-                "warfare",
-                "rulebreaks",
-                "admin_reports",
-                "bug_report",
-                "compensation_request",
+                "How did this bug first occur?",
+                "Did you lose anything as a result of the bug?",
+                "Is this bug repeatable?",
+                "Additional Comments? (Put N/A if no)",
+            ],
+        )
+        self.assertEqual(modal.children[-1].text, "Upload files")
+        self.assertEqual(modal.children[-1].component.max_values, 10)
+
+    def test_upload_names_are_unique_and_keep_allowed_extension(self):
+        named_uploads, error = prepare_named_uploads(
+            "Server evidence\nreport.json",
+            [
+                {"original_name": "evidence.PNG", "data": b"image"},
+                {"original_name": "upload.json", "data": b"{}"},
             ],
         )
 
+        self.assertIsNone(error)
+        self.assertEqual(
+            named_uploads,
+            [
+                {"filename": "Server evidence.png", "data": b"image"},
+                {"filename": "report.json", "data": b"{}"},
+            ],
+        )
+
+    def test_rejects_unsupported_extensions_and_duplicate_names(self):
+        unsupported, unsupported_error = prepare_named_uploads(
+            "malware.exe", [{"original_name": "upload.exe", "data": b"x"}]
+        )
+        duplicates, duplicate_error = prepare_named_uploads(
+            "evidence.jpg\nEVIDENCE.JPG",
+            [
+                {"original_name": "one.jpg", "data": b"1"},
+                {"original_name": "two.jpg", "data": b"2"},
+            ],
+        )
+
+        self.assertIsNone(unsupported)
+        self.assertIn("Unsupported file format", unsupported_error)
+        self.assertIsNone(duplicates)
+        self.assertIn("unique name", duplicate_error)
+
+    def test_requires_a_name_per_file_and_matching_extension(self):
+        missing_name, missing_error = prepare_named_uploads(
+            "", [{"original_name": "evidence.jpg", "data": b"x"}]
+        )
+        changed_extension, extension_error = prepare_named_uploads(
+            "evidence.png", [{"original_name": "evidence.jpg", "data": b"x"}]
+        )
+
+        self.assertIsNone(missing_name)
+        self.assertIn("exactly 1", missing_error)
+        self.assertIsNone(changed_extension)
+        self.assertIn("original accepted file extension", extension_error)
+
+
+class TicketCreationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_ticket_uses_category_and_sends_answers_with_uploads(self):
+        with patch.dict(
+            os.environ,
+            {
+                "TICKET_GUILD_CONFIGS": (
+                    '{"123": {"channel_id": 456, "category_id": 789}}'
+                ),
+                "TICKET_STATE_PATH": os.devnull,
+            },
+        ):
+            cog = TicketingCog(SimpleNamespace())
+
+        class Category:
+            overwrites = {}
+
+        category = Category()
+        ticket_channel = SimpleNamespace(
+            mention="#bug-0001",
+            send=AsyncMock(),
+        )
+        guild = SimpleNamespace(
+            id=123,
+            default_role=Mock(),
+            me=None,
+            get_channel=Mock(return_value=category),
+            create_text_channel=AsyncMock(return_value=ticket_channel),
+        )
+        interaction = SimpleNamespace(
+            guild=guild,
+            user=Mock(mention="<@42>"),
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+
+        with patch("ticketing.discord.CategoryChannel", Category):
+            await cog.create_ticket(
+                interaction,
+                {"How did this bug first occur?": "After restart"},
+                "bug_report",
+                [{"filename": "crash.txt", "data": b"log data"}],
+            )
+
+        create_kwargs = guild.create_text_channel.await_args.kwargs
+        self.assertEqual(create_kwargs["name"], "bug-0001")
+        self.assertIs(create_kwargs["category"], category)
+        send_kwargs = ticket_channel.send.await_args.kwargs
+        self.assertEqual(send_kwargs["embed"].fields[0].name, "How did this bug first occur?")
+        self.assertEqual(send_kwargs["embed"].fields[0].value, "After restart")
+        self.assertEqual([upload.filename for upload in send_kwargs["files"]], ["crash.txt"])
+        self.assertEqual(send_kwargs["files"][0].fp.read(), b"log data")
+
+
+class TicketPanelStartupTests(unittest.IsolatedAsyncioTestCase):
     async def test_missing_guild_config_is_logged(self):
         with patch.dict(
             os.environ,
@@ -128,300 +186,15 @@ class TicketPanelStartupTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(cog, "_configured_channel", new=AsyncMock(return_value=Channel())):
             await cog.upsert_panel(guild)
 
-        self.assertEqual(posted["embed"].title, "Make a ticket:")
-        self.assertEqual(
-            posted["embed"].description,
-            "Should you need assistance with anything, create a ticket below. "
-            "Our staff will get to your ticket as soon as possible; Please be patient. ",
-        )
+        self.assertEqual(posted["embed"].title, "Ticket types:")
         self.assertIsNone(posted["view"].timeout)
+        self.assertEqual(posted["view"].children[0].label, "General Support")
         self.assertEqual(
-            [button.label for button in posted["view"].children],
-            [
-                "General Support",
-                "Whitelist Submission",
-                "Warfare",
-                "Rulebreak Report",
-                "Admin Report",
-                "Bug Report",
-                "Compensation Request",
-            ],
+            [button.style for button in posted["view"].children],
+            [discord.ButtonStyle.secondary, discord.ButtonStyle.secondary],
         )
-        self.assertEqual(posted["view"].children[0].emoji.name, "❓")
-        self.assertEqual(posted["view"].children[1].emoji.name, "✍️")
-        self.assertEqual(posted["view"].children[2].emoji.name, "⚔️")
-        self.assertEqual(posted["view"].children[3].emoji.name, "❌")
-        self.assertEqual(posted["view"].children[4].emoji.name, "🚨")
-        self.assertEqual(posted["view"].children[5].emoji.name, "🪲")
-        self.assertEqual(posted["view"].children[6].emoji.name, "🪙")
-        self.assertEqual(posted["embed"].colour.value, 0x3C3CE8)
+        self.assertEqual(posted["embed"].footer.text, "STALKER: Lost Zone Ticket Bot - Stalker Support")
         self.assertEqual(GeneralSupportModal(cog).children[0].text, "Describe your issue:")
-        self.assertEqual(
-            WhitelistSubmissionModal(cog).children[0].text,
-            "What is your Character's Name?",
-        )
-
-    async def test_report_modals_have_questions_without_prefaces(self):
-        with patch.dict(os.environ, {"TICKET_STATE_PATH": os.devnull}):
-            cog = TicketingCog(SimpleNamespace())
-
-        rulebreak_modal = TicketSubmissionModal(cog, "rulebreaks")
-        self.assertEqual(
-            [item.text for item in rulebreak_modal.children],
-            [
-                "Player(s) involved:",
-                "Player(s) being accused:",
-                "Rule(s) being broken:",
-                "Describe the incident:",
-            ],
-        )
-
-        admin_modal = TicketSubmissionModal(cog, "admin_reports")
-        self.assertEqual(
-            [item.text for item in admin_modal.children],
-            [
-                "Player(s) involved:",
-                "Admin(s) accused:",
-                "Describe the incident:",
-            ],
-        )
-
-        bug_modal = TicketSubmissionModal(cog, "bug_report")
-        self.assertEqual(
-            [item.text for item in bug_modal.children],
-            [
-                "How did this first occur?",
-                "How did the bug first happen?",
-                "Is it repeatable?",
-            ],
-        )
-        compensation_modal = TicketSubmissionModal(cog, "compensation_request")
-        self.assertEqual(
-            [item.text for item in compensation_modal.children],
-            [
-                "What item(s) were lost, and require compensation?",
-                "How did the loss occur?",
-            ],
-        )
-        acknowledgment_modal = TicketAcknowledgmentModal(
-            cog, "rulebreaks", {}, EVIDENCE_ACKNOWLEDGMENT
-        )
-        self.assertEqual(
-            acknowledgment_modal.children[0].content,
-            EVIDENCE_ACKNOWLEDGMENT,
-        )
-        self.assertEqual(acknowledgment_modal.children[1].text, "Your response:")
-
-
-class TicketCreationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_general_ticket_uses_category_unique_name_and_opening_message(self):
-        bot = SimpleNamespace(user=object())
-        config = '{"123": {"channel_id": 456}}'
-        categories = '{"123": {"general_support": 789}}'
-        with patch.dict(
-            os.environ,
-            {
-                "TICKET_GUILD_CONFIGS": config,
-                "TICKET_CATEGORY_CONFIGS": categories,
-                "TICKET_STATE_PATH": os.devnull,
-            },
-        ):
-            cog = TicketingCog(bot)
-
-        class Category:
-            overwrites = {}
-
-        category = Category()
-        created_channel = SimpleNamespace(
-            mention="#gen-0002", send=AsyncMock()
-        )
-        guild = SimpleNamespace(
-            id=123,
-            channels=[SimpleNamespace(name="gen-0001")],
-            roles=[SimpleNamespace(name="Support Staff", mention="<@&99>")],
-            default_role=object(),
-            me=None,
-            get_channel=Mock(return_value=category),
-            create_text_channel=AsyncMock(return_value=created_channel),
-        )
-        requester = Mock(mention="<@42>")
-        interaction = SimpleNamespace(
-            guild=guild,
-            user=requester,
-            response=SimpleNamespace(defer=AsyncMock()),
-            followup=SimpleNamespace(send=AsyncMock()),
-        )
-
-        with patch("ticketing.discord.CategoryChannel", Category):
-            await cog.create_ticket(interaction, "I need help")
-
-        guild.create_text_channel.assert_awaited_once()
-        channel_kwargs = guild.create_text_channel.await_args.kwargs
-        self.assertEqual(channel_kwargs["name"], "gen-0002")
-        self.assertIs(channel_kwargs["category"], category)
-        message_kwargs = created_channel.send.await_args.kwargs
-        self.assertIn("<@42> - Thank you for opening a ticket.", message_kwargs["content"])
-        self.assertIn("@ Support Staff", message_kwargs["content"])
-        self.assertNotIn("<@&99>", message_kwargs["content"])
-        self.assertIn("General ticket", message_kwargs["embed"].description)
-        self.assertEqual(message_kwargs["embed"].fields[0].name, "Question:")
-        self.assertEqual(message_kwargs["embed"].fields[0].value, "*I need help*")
-
-    async def test_warfare_answers_are_all_written_to_the_ticket(self):
-        bot = SimpleNamespace(user=object())
-        config = '{"123": {"channel_id": 456}}'
-        categories = '{"123": {"warfare": 789}}'
-        with patch.dict(
-            os.environ,
-            {
-                "TICKET_GUILD_CONFIGS": config,
-                "TICKET_CATEGORY_CONFIGS": categories,
-                "TICKET_STATE_PATH": os.devnull,
-            },
-        ):
-            cog = TicketingCog(bot)
-
-        class Category:
-            overwrites = {}
-
-        category = Category()
-        created_channel = SimpleNamespace(mention="#war-0001", send=AsyncMock())
-        guild = SimpleNamespace(
-            id=123,
-            channels=[],
-            default_role=object(),
-            me=None,
-            get_channel=Mock(return_value=category),
-            create_text_channel=AsyncMock(return_value=created_channel),
-        )
-        interaction = SimpleNamespace(
-            guild=guild,
-            user=Mock(mention="<@42>"),
-            response=SimpleNamespace(defer=AsyncMock()),
-            followup=SimpleNamespace(send=AsyncMock()),
-        )
-        answers = {
-            "Group attacking:": "North squad",
-            "Node Being Attacked:": "Node 7",
-            "Additional Information:": "Attack starts at 20:00 UTC",
-        }
-
-        with patch("ticketing.discord.CategoryChannel", Category):
-            await cog.create_ticket(interaction, answers, "warfare")
-
-        channel_kwargs = guild.create_text_channel.await_args.kwargs
-        self.assertEqual(channel_kwargs["name"], "war-0001")
-        self.assertIs(channel_kwargs["category"], category)
-        fields = created_channel.send.await_args.kwargs["embed"].fields
-        self.assertEqual(
-            [(field.name, field.value) for field in fields],
-            [
-                ("Group attacking:", "*North squad*"),
-                ("Node Being Attacked:", "*Node 7*"),
-                ("Additional Information:", "*Attack starts at 20:00 UTC*"),
-            ],
-        )
-
-    async def test_whitelist_answer_is_posted_in_whitelist_ticket(self):
-        bot = SimpleNamespace(user=object())
-        config = '{"123": {"channel_id": 456}}'
-        categories = '{"123": {"whitelist_submission": 987}}'
-        with patch.dict(
-            os.environ,
-            {
-                "TICKET_GUILD_CONFIGS": config,
-                "TICKET_CATEGORY_CONFIGS": categories,
-                "TICKET_STATE_PATH": os.devnull,
-            },
-        ):
-            cog = TicketingCog(bot)
-
-        class Category:
-            name = "Whitelist"
-            overwrites = {}
-
-        category = Category()
-        created_channel = SimpleNamespace(mention="#wls-0001", send=AsyncMock())
-        guild = SimpleNamespace(
-            id=123,
-            channels=[],
-            roles=[],
-            default_role=object(),
-            me=None,
-            get_channel=Mock(return_value=category),
-            create_text_channel=AsyncMock(return_value=created_channel),
-        )
-        requester = Mock(mention="<@42>")
-        interaction = SimpleNamespace(
-            guild=guild,
-            user=requester,
-            response=SimpleNamespace(defer=AsyncMock()),
-            followup=SimpleNamespace(send=AsyncMock()),
-        )
-
-        with patch("ticketing.discord.CategoryChannel", Category):
-            await cog.create_ticket(
-                interaction, "Aster Vale", "whitelist_submission"
-            )
-
-        channel_kwargs = guild.create_text_channel.await_args.kwargs
-        self.assertEqual(channel_kwargs["name"], "wls-0001")
-        self.assertIs(channel_kwargs["category"], category)
-        message_kwargs = created_channel.send.await_args.kwargs
-        self.assertIn("Whitelist ticket", message_kwargs["embed"].description)
-        self.assertEqual(
-            message_kwargs["embed"].fields[0].name,
-            "What is your Character's Name?",
-        )
-        self.assertEqual(message_kwargs["embed"].fields[0].value, "*Aster Vale*")
-
-    async def test_compensation_answers_and_acknowledgment_are_posted(self):
-        bot = SimpleNamespace(user=object())
-        config = '{"123": {"channel_id": 456}}'
-        categories = '{"123": {"compensation_request": 987}}'
-        with patch.dict(
-            os.environ,
-            {
-                "TICKET_GUILD_CONFIGS": config,
-                "TICKET_CATEGORY_CONFIGS": categories,
-                "TICKET_STATE_PATH": os.devnull,
-            },
-        ):
-            cog = TicketingCog(bot)
-
-        class Category:
-            overwrites = {}
-
-        category = Category()
-        created_channel = SimpleNamespace(mention="#cmp-0001", send=AsyncMock())
-        guild = SimpleNamespace(
-            id=123,
-            channels=[],
-            default_role=object(),
-            me=None,
-            get_channel=Mock(return_value=category),
-            create_text_channel=AsyncMock(return_value=created_channel),
-        )
-        interaction = SimpleNamespace(
-            guild=guild,
-            user=Mock(mention="<@42>"),
-            response=SimpleNamespace(defer=AsyncMock()),
-            followup=SimpleNamespace(send=AsyncMock()),
-        )
-        answers = {
-            "What item(s) were lost, and require compensation?": "A vehicle",
-            "How did the loss occur?": "Server crash",
-            EVIDENCE_ACKNOWLEDGMENT: "Yes, I understand.",
-        }
-
-        with patch("ticketing.discord.CategoryChannel", Category):
-            await cog.create_ticket(interaction, answers, "compensation_request")
-
-        channel_kwargs = guild.create_text_channel.await_args.kwargs
-        self.assertEqual(channel_kwargs["name"], "cmp-0001")
-        fields = created_channel.send.await_args.kwargs["embed"].fields
-        self.assertEqual(fields[-1].name, EVIDENCE_ACKNOWLEDGMENT)
-        self.assertEqual(fields[-1].value, "*Yes, I understand.*")
 
 
 if __name__ == "__main__":

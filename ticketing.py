@@ -1,4 +1,5 @@
 import json
+import io
 import logging
 import os
 from typing import Any
@@ -10,121 +11,65 @@ from discord.ext import commands
 
 logger = logging.getLogger(__name__)
 
-EVIDENCE_ACKNOWLEDGMENT = (
-    "Do you understand that without providing evidence of the situation, that "
-    "there is little staff can do for you, and therefore are not entitled to a "
-    "satisfying resolution?"
-)
-
+PANEL_FOOTER = "STALKER: Lost Zone Ticket Bot - Stalker Support"
+LEGACY_PANEL_FOOTER = "zvtbot-ticket-panel-v1"
+ALLOWED_FILE_EXTENSIONS = {".jpg", ".png", ".json", ".zip", ".txt", ".mp3", ".mp4"}
 
 TICKET_TYPES = {
     "general_support": {
         "label": "General Support",
-        "emoji": "❓",
-        "category_name": "General",
         "modal_title": "General Support",
-        "channel_prefix": "gen",
+        "channel_prefix": "support",
         "questions": [
-            {
-                "label": "Describe your issue:",
-                "answer_label": "Question:",
-                "multiline": True,
-                "max_length": 2000,
-            }
+            {"label": "Describe your issue:", "multiline": True, "max_length": 1000}
         ],
-    },
-    "whitelist_submission": {
-        "label": "Whitelist Submission",
-        "emoji": "✍️",
-        "category_name": "Whitelist",
-        "modal_title": "Whitelist Submission",
-        "channel_prefix": "wls",
-        "questions": [
-            {
-                "label": "What is your Character's Name?",
-                "max_length": 100,
-            }
-        ],
-    },
-    "warfare": {
-        "label": "Warfare",
-        "emoji": "⚔️",
-        "category_name": "Warfare",
-        "modal_title": "Warfare Report",
-        "channel_prefix": "war",
-        "questions": [
-            {"label": "Group attacking:", "max_length": 200},
-            {"label": "Node Being Attacked:", "max_length": 200},
-            {
-                "label": "Additional Information:",
-                "multiline": True,
-                "max_length": 2000,
-            },
-        ],
-    },
-    "rulebreaks": {
-        "label": "Rulebreak Report",
-        "emoji": "❌",
-        "category_name": "Rulebreaks",
-        "modal_title": "Rulebreak Report",
-        "channel_prefix": "rbr",
-        "questions": [
-            {"label": "Player(s) involved:", "max_length": 500},
-            {"label": "Player(s) being accused:", "max_length": 500},
-            {"label": "Rule(s) being broken:", "max_length": 500},
-            {
-                "label": "Describe the incident:",
-                "multiline": True,
-                "max_length": 2000,
-            },
-        ],
-        "acknowledgment": EVIDENCE_ACKNOWLEDGMENT,
-    },
-    "admin_reports": {
-        "label": "Admin Report",
-        "emoji": "🚨",
-        "category_name": "Admin Reports",
-        "modal_title": "Admin Report",
-        "channel_prefix": "adm",
-        "questions": [
-            {"label": "Player(s) involved:", "max_length": 500},
-            {"label": "Admin(s) accused:", "max_length": 500},
-            {
-                "label": "Describe the incident:",
-                "multiline": True,
-                "max_length": 2000,
-            },
-        ],
-        "acknowledgment": EVIDENCE_ACKNOWLEDGMENT,
     },
     "bug_report": {
         "label": "Bug Report",
-        "emoji": "🪲",
-        "category_name": "Bug Report",
         "modal_title": "Bug Report",
         "channel_prefix": "bug",
         "questions": [
-            {"label": "How did this first occur?", "max_length": 1000},
-            {"label": "How did the bug first happen?", "max_length": 1000},
-            {"label": "Is it repeatable?", "max_length": 500},
+            {"label": "How did this bug first occur?", "max_length": 1000},
+            {"label": "Did you lose anything as a result of the bug?", "max_length": 1000},
+            {"label": "Is this bug repeatable?", "max_length": 1000},
+            {"label": "Additional Comments? (Put N/A if no)", "max_length": 1000},
         ],
-    },
-    "compensation_request": {
-        "label": "Compensation Request",
-        "emoji": "🪙",
-        "category_name": "Compensation Request",
-        "modal_title": "Compensation Request",
-        "channel_prefix": "cmp",
-        "questions": [
-            {
-                "label": "What item(s) were lost, and require compensation?",
-                "max_length": 1000,
-            },
-            {"label": "How did the loss occur?", "max_length": 1000},
-        ],
-        "acknowledgment": EVIDENCE_ACKNOWLEDGMENT,
     },
 }
+
+
+def validate_upload_extension(filename: str) -> bool:
+    return os.path.splitext(filename)[1].lower() in ALLOWED_FILE_EXTENSIONS
+
+
+def prepare_named_uploads(
+    names_text: str, uploads: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]] | None, str | None]:
+    names = [name.strip() for name in names_text.splitlines()]
+    if len(names) != len(uploads) or any(not name for name in names):
+        return None, f"Enter exactly {len(uploads)} non-empty filename(s), one per line."
+
+    prepared: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+    for name, upload in zip(names, uploads):
+        original_extension = os.path.splitext(upload["original_name"])[1].lower()
+        if not validate_upload_extension(upload["original_name"]):
+            return None, f"Unsupported file format: {upload['original_name']}"
+        if "/" in name or "\\" in name or "\0" in name or name in {".", ".."}:
+            return None, "File names cannot contain path separators."
+        if not os.path.splitext(name)[1]:
+            name += original_extension
+        extension = os.path.splitext(name)[1].lower()
+        if extension not in ALLOWED_FILE_EXTENSIONS or extension != original_extension:
+            return None, f"Use the original accepted file extension for {upload['original_name']}."
+        if len(name) > 100:
+            return None, "File names must be 100 characters or fewer."
+        if name.casefold() in seen_names:
+            return None, "Each uploaded file needs a unique name."
+        seen_names.add(name.casefold())
+        prepared.append({"filename": name, "data": upload["data"]})
+
+    return prepared, None
 
 
 def parse_ticket_guild_configs(raw: str) -> dict[str, dict[str, int]]:
@@ -148,6 +93,8 @@ def parse_ticket_guild_configs(raw: str) -> dict[str, dict[str, int]]:
 
         try:
             normalized = {"channel_id": int(config["channel_id"])}
+            if config.get("category_id") not in (None, ""):
+                normalized["category_id"] = int(config["category_id"])
             configs[str(int(guild_id))] = normalized
         except (TypeError, ValueError) as exc:
             raise RuntimeError(
@@ -157,126 +104,108 @@ def parse_ticket_guild_configs(raw: str) -> dict[str, dict[str, int]]:
     return configs
 
 
-def parse_ticket_category_configs(raw: str) -> dict[str, dict[str, int]]:
-    if not raw.strip():
-        return {}
-
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"TICKET_CATEGORY_CONFIGS must be valid JSON: {exc.msg}") from exc
-
-    if not isinstance(parsed, dict):
-        raise RuntimeError("TICKET_CATEGORY_CONFIGS must be a JSON object keyed by guild id.")
-
-    configs: dict[str, dict[str, int]] = {}
-    for guild_id, categories in parsed.items():
-        if not isinstance(categories, dict):
-            raise RuntimeError(f"TICKET_CATEGORY_CONFIGS[{guild_id}] must be an object.")
-
-        try:
-            configs[str(int(guild_id))] = {
-                ticket_type: int(category_id)
-                for ticket_type, category_id in categories.items()
-                if category_id not in (None, "")
-            }
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError(
-                f"TICKET_CATEGORY_CONFIGS[{guild_id}] IDs must be integers."
-            ) from exc
-
-    return configs
-
-
 class TicketPanelView(discord.ui.View):
     def __init__(self, cog: "TicketingCog", guild_id: int):
         super().__init__(timeout=None)
         self.cog = cog
-        for ticket_type_key in cog.get_enabled_types(guild_id):
-            self.add_item(TicketPanelButton(cog, ticket_type_key))
+        for ticket_type in cog.get_enabled_types(guild_id):
+            self.add_item(TicketPanelButton(cog, ticket_type))
 
 
 class TicketPanelButton(discord.ui.Button):
-    def __init__(self, cog: "TicketingCog", ticket_type_key: str):
-        ticket_type = TICKET_TYPES[ticket_type_key]
+    def __init__(self, cog: "TicketingCog", ticket_type: str):
+        config = TICKET_TYPES[ticket_type]
         super().__init__(
-            label=ticket_type["label"],
-            style=discord.ButtonStyle.primary,
-            emoji=ticket_type["emoji"],
-            custom_id=f"ticketing:{ticket_type_key}",
+            label=config["label"],
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"ticketing:{ticket_type}",
         )
         self.cog = cog
-        self.ticket_type_key = ticket_type_key
+        self.ticket_type = ticket_type
 
     async def callback(self, interaction: discord.Interaction) -> None:
         await interaction.response.send_modal(
-            TicketSubmissionModal(self.cog, self.ticket_type_key)
+            TicketSubmissionModal(self.cog, self.ticket_type)
         )
 
 
 class TicketSubmissionModal(discord.ui.Modal):
-    def __init__(self, cog: "TicketingCog", ticket_type_key: str):
-        ticket_type = TICKET_TYPES[ticket_type_key]
-        super().__init__(title=ticket_type["modal_title"])
+    def __init__(self, cog: "TicketingCog", ticket_type: str):
+        config = TICKET_TYPES[ticket_type]
+        super().__init__(title=config["modal_title"])
         self.cog = cog
-        self.ticket_type_key = ticket_type_key
-        self.questions: list[tuple[dict[str, Any], discord.ui.TextInput]] = []
-
-        for question in ticket_type["questions"]:
-            text_input = discord.ui.TextInput(
+        self.ticket_type = ticket_type
+        self.question_fields: list[tuple[str, discord.ui.TextInput]] = []
+        for question in config["questions"]:
+            field = discord.ui.TextInput(
                 style=(
                     discord.TextStyle.paragraph
                     if question.get("multiline")
                     else discord.TextStyle.short
                 ),
-                max_length=question.get("max_length", 500),
+                max_length=question["max_length"],
             )
-            self.add_item(
-                discord.ui.Label(text=question["label"], component=text_input)
-            )
-            self.questions.append((question, text_input))
+            self.add_item(discord.ui.Label(text=question["label"], component=field))
+            self.question_fields.append((question["label"], field))
+
+        self.upload_field = discord.ui.Label(
+            text="Upload files",
+            description="Optional. Accepted: .jpg, .png, .json, .zip, .txt, .mp3, .mp4",
+            component=discord.ui.FileUpload(
+                required=False,
+                min_values=0,
+                max_values=10,
+            ),
+        )
+        self.add_item(self.upload_field)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        answers = {
-            question["label"]: text_input.value
-            for question, text_input in self.questions
-        }
-        if acknowledgment := TICKET_TYPES[self.ticket_type_key].get("acknowledgment"):
-            await interaction.response.send_modal(
-                TicketAcknowledgmentModal(
-                    self.cog, self.ticket_type_key, answers, acknowledgment
-                )
+        answers = {label: field.value for label, field in self.question_fields}
+        attachments = self.upload_field.component.values
+        invalid_files = [
+            attachment.filename
+            for attachment in attachments
+            if not validate_upload_extension(attachment.filename)
+        ]
+        if invalid_files:
+            await interaction.response.send_message(
+                "Unsupported file format(s): "
+                + ", ".join(invalid_files)
+                + ". Accepted formats: .jpg, .png, .json, .zip, .txt, .mp3, .mp4.",
+                ephemeral=True,
             )
             return
-        await self.cog.create_ticket(interaction, answers, self.ticket_type_key)
 
+        uploads = []
+        try:
+            for attachment in attachments:
+                uploads.append(
+                    {
+                        "original_name": attachment.filename,
+                        "data": await attachment.read(),
+                    }
+                )
+        except (discord.HTTPException, OSError):
+            await interaction.response.send_message(
+                "One or more uploaded files could not be read. Please try again.",
+                ephemeral=True,
+            )
+            return
 
-class TicketAcknowledgmentModal(discord.ui.Modal, title="Final Acknowledgment"):
-    def __init__(
-        self,
-        cog: "TicketingCog",
-        ticket_type_key: str,
-        answers: dict[str, str],
-        acknowledgment: str,
-    ):
-        super().__init__()
-        self.cog = cog
-        self.ticket_type_key = ticket_type_key
-        self.answers = answers
-        self.add_item(discord.ui.TextDisplay(content=acknowledgment))
-        self.answer = discord.ui.TextInput(
-            style=discord.TextStyle.short,
-            max_length=500,
-        )
-        self.add_item(
-            discord.ui.Label(text="Your response:", component=self.answer)
-        )
+        pending = {
+            "ticket_type": self.ticket_type,
+            "answers": answers,
+            "uploads": uploads,
+        }
+        if uploads:
+            await interaction.response.send_message(
+                f"Upload received. Name each of the {len(uploads)} file(s) in upload order.",
+                view=FileNamingView(self.cog, pending),
+                ephemeral=True,
+            )
+            return
 
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        self.answers[EVIDENCE_ACKNOWLEDGMENT] = self.answer.value
-        await self.cog.create_ticket(
-            interaction, self.answers, self.ticket_type_key
-        )
+        await self.cog.create_ticket(interaction, answers, self.ticket_type, [])
 
 
 class GeneralSupportModal(TicketSubmissionModal):
@@ -284,9 +213,61 @@ class GeneralSupportModal(TicketSubmissionModal):
         super().__init__(cog, "general_support")
 
 
-class WhitelistSubmissionModal(TicketSubmissionModal):
+class BugReportModal(TicketSubmissionModal):
     def __init__(self, cog: "TicketingCog"):
-        super().__init__(cog, "whitelist_submission")
+        super().__init__(cog, "bug_report")
+
+
+class FileNamingView(discord.ui.View):
+    def __init__(self, cog: "TicketingCog", pending: dict[str, Any]):
+        super().__init__(timeout=180)
+        self.add_item(FileNamingButton(cog, pending))
+
+
+class FileNamingButton(discord.ui.Button):
+    def __init__(self, cog: "TicketingCog", pending: dict[str, Any]):
+        super().__init__(label="Name uploaded files", style=discord.ButtonStyle.secondary)
+        self.cog = cog
+        self.pending = pending
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_modal(FileNamingModal(self.cog, self.pending))
+
+
+class FileNamingModal(discord.ui.Modal, title="Name uploaded files"):
+    def __init__(self, cog: "TicketingCog", pending: dict[str, Any]):
+        super().__init__()
+        self.cog = cog
+        self.pending = pending
+        self.names = discord.ui.Label(
+            text="File names",
+            description="One name per line, in upload order. Keep each file's original extension.",
+            component=discord.ui.TextInput(
+                style=discord.TextStyle.paragraph,
+                placeholder="Example: evidence.jpg",
+                max_length=1000,
+            ),
+        )
+        self.add_item(self.names)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        uploads, error = prepare_named_uploads(
+            self.names.component.value,
+            self.pending["uploads"],
+        )
+        if error:
+            await interaction.response.send_message(
+                f"{error} Please enter one filename per line.",
+                view=FileNamingView(self.cog, self.pending),
+                ephemeral=True,
+            )
+            return
+        await self.cog.create_ticket(
+            interaction,
+            self.pending["answers"],
+            self.pending["ticket_type"],
+            uploads or [],
+        )
 
 
 class TicketConfigView(discord.ui.View):
@@ -338,21 +319,8 @@ class TicketingCog(commands.Cog):
         self.guild_configs = parse_ticket_guild_configs(
             os.getenv("TICKET_GUILD_CONFIGS", "")
         )
-        self.category_configs = parse_ticket_category_configs(
-            os.getenv("TICKET_CATEGORY_CONFIGS", "")
-        )
         self.state_path = os.getenv("TICKET_STATE_PATH", "ticket_state.json")
         self.state = self._load_state()
-        if self.state.get("ticket_types_version", 1) < 7:
-            for enabled_types in self.state["enabled_types"].values():
-                if "general_support" in enabled_types:
-                    enabled_types.extend(
-                        ticket_type_key
-                        for ticket_type_key in TICKET_TYPES
-                        if ticket_type_key not in enabled_types
-                    )
-            self.state["ticket_types_version"] = 7
-            self._save_state()
         self.panel_messages: dict[int, discord.Message] = {}
 
     def _load_state(self) -> dict[str, Any]:
@@ -431,18 +399,13 @@ class TicketingCog(commands.Cog):
             return
 
         enabled = self.get_enabled_types(guild.id)
-        view = None
-        if enabled:
-            view = TicketPanelView(self, guild.id)
+        view = TicketPanelView(self, guild.id) if enabled else None
         embed = discord.Embed(
-            title="Make a ticket:",
-            description=(
-                "Should you need assistance with anything, create a ticket below. "
-                "Our staff will get to your ticket as soon as possible; Please be patient. "
-            ),
-            colour=discord.Colour(0x3C3CE8),
+            title="Ticket types:",
+            description="Select a button below to contact the support team.",
+            colour=discord.Colour.blurple(),
         )
-        embed.set_footer(text="zvtbot-ticket-panel-v1")
+        embed.set_footer(text=PANEL_FOOTER)
 
         message = self.panel_messages.get(guild.id)
         if message is not None:
@@ -457,7 +420,8 @@ class TicketingCog(commands.Cog):
                 if (
                     candidate.author == self.bot.user
                     and candidate.embeds
-                    and candidate.embeds[0].footer.text == "zvtbot-ticket-panel-v1"
+                    and candidate.embeds[0].footer.text
+                    in {PANEL_FOOTER, LEGACY_PANEL_FOOTER}
                 ):
                     self.panel_messages[guild.id] = candidate
                     if view is not None:
@@ -518,8 +482,9 @@ class TicketingCog(commands.Cog):
     async def create_ticket(
         self,
         interaction: discord.Interaction,
-        issue: str | dict[str, str],
-        ticket_type_key: str = "general_support",
+        answers: dict[str, str],
+        ticket_type: str,
+        uploads: list[dict[str, Any]],
     ) -> None:
         guild = interaction.guild
         if guild is None:
@@ -535,15 +500,15 @@ class TicketingCog(commands.Cog):
             )
             return
 
+        if ticket_type not in TICKET_TYPES:
+            await interaction.response.send_message(
+                "Unknown ticket type.", ephemeral=True
+            )
+            return
+
         await interaction.response.defer(ephemeral=True, thinking=True)
-        ticket_type = TICKET_TYPES[ticket_type_key]
-        answers = (
-            {ticket_type["questions"][0]["label"]: issue}
-            if isinstance(issue, str)
-            else issue
-        )
         category = None
-        category_id = self.category_configs.get(str(guild.id), {}).get(ticket_type_key)
+        category_id = config.get("category_id")
         if category_id is not None:
             resolved_category = guild.get_channel(category_id)
             if resolved_category is None:
@@ -555,44 +520,16 @@ class TicketingCog(commands.Cog):
                 category = resolved_category
             else:
                 await interaction.followup.send(
-                    f"The configured {ticket_type['category_name']} ticket category could not be found. "
-                    "Check TICKET_CATEGORY_CONFIGS.",
-                    ephemeral=True,
-                )
-                return
-        else:
-            category = next(
-                (
-                    candidate
-                    for candidate in getattr(guild, "categories", [])
-                    if candidate.name.casefold() == ticket_type["category_name"].casefold()
-                ),
-                None,
-            )
-            if category is None:
-                await interaction.followup.send(
-                    f"Create a '{ticket_type['category_name']}' category or configure "
-                    f"'{ticket_type_key}' in TICKET_CATEGORY_CONFIGS.",
+                    "The configured ticket category could not be found. Check TICKET_GUILD_CONFIGS.",
                     ephemeral=True,
                 )
                 return
 
-        counters = self.state["counters"]
-        last_ticket_number = int(counters.get(str(guild.id), 0))
-        existing_names = {channel.name for channel in guild.channels}
-        ticket_number = None
-        for offset in range(1, 10000):
-            candidate_number = (last_ticket_number + offset - 1) % 9999 + 1
-            if f"{ticket_type['channel_prefix']}-{candidate_number:04d}" not in existing_names:
-                ticket_number = candidate_number
-                break
-        if ticket_number is None:
-            await interaction.followup.send(
-                "No unique ticket number is available.", ephemeral=True
-            )
-            return
-        counters[str(guild.id)] = ticket_number
-        self._save_state()
+            counter_key = f"{guild.id}:{ticket_type}"
+            counters = self.state["counters"]
+            ticket_number = int(counters.get(counter_key, 0)) + 1
+            counters[counter_key] = ticket_number
+            self._save_state()
 
         requester = interaction.user
         overwrites = dict(category.overwrites) if category is not None else {}
@@ -610,41 +547,29 @@ class TicketingCog(commands.Cog):
             )
 
         try:
+            ticket_config = TICKET_TYPES[ticket_type]
             channel = await guild.create_text_channel(
-                name=f"{ticket_type['channel_prefix']}-{ticket_number:04d}",
+                name=f"{ticket_config['channel_prefix']}-{ticket_number:04d}",
                 category=category,
                 overwrites=overwrites,
-                reason=f"{ticket_type['label']} ticket created",
+                reason=f"{ticket_config['label']} ticket created",
             )
-            opening_embed = discord.Embed(
-                description=(
-                    f"{requester.mention} has opened a "
-                    f"{ticket_type['category_name']} ticket."
-                ),
-                colour=discord.Colour(0x3C3CE8),
+            embed = discord.Embed(
+                title=ticket_config["label"],
+                description=f"Ticket opened by {requester.mention}.",
+                colour=discord.Colour.blurple(),
             )
-            for question in ticket_type["questions"]:
-                answer = answers.get(question["label"], "")
-                opening_embed.add_field(
-                    name=question.get("answer_label", question["label"]),
-                    value=f"*{answer}*",
+            for question, answer in answers.items():
+                embed.add_field(
+                    name=question,
+                    value=answer or "N/A",
                     inline=False,
                 )
-            if acknowledgment := ticket_type.get("acknowledgment"):
-                opening_embed.add_field(
-                    name=acknowledgment,
-                    value=f"*{answers.get(acknowledgment, '')}*",
-                    inline=False,
-                )
-            staff_text = "\n@ Support Staff" if ticket_type_key == "general_support" else ""
-            await channel.send(
-                content=(
-                    f"{requester.mention} - Thank you for opening a ticket. "
-                    "Please be patient while staff gets to your issue."
-                    f"{staff_text}"
-                ),
-                embed=opening_embed,
-            )
+            files = [
+                discord.File(io.BytesIO(upload["data"]), filename=upload["filename"])
+                for upload in uploads
+            ]
+            await channel.send(embed=embed, files=files)
         except (discord.Forbidden, discord.HTTPException):
             await interaction.followup.send(
                 "I could not create the ticket channel. Check my channel permissions.",
