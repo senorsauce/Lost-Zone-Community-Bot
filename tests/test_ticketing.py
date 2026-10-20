@@ -11,12 +11,13 @@ from ticketing import (
     TicketPanelView,
     TicketingCog,
     prepare_named_uploads,
+    parse_ticket_category_configs,
     parse_ticket_guild_configs,
 )
 
 
 class TicketGuildConfigTests(unittest.TestCase):
-    def test_parses_per_guild_channel_and_optional_category(self):
+    def test_parses_per_guild_panel_channels(self):
         configs = parse_ticket_guild_configs(
             '{"123": {"channel_id": "456", "category_id": "789"}, '
             '"234": {"channel_id": 567}}'
@@ -24,8 +25,15 @@ class TicketGuildConfigTests(unittest.TestCase):
 
         self.assertEqual(
             configs,
-            {"123": {"channel_id": 456, "category_id": 789}, "234": {"channel_id": 567}},
+            {"123": {"channel_id": 456}, "234": {"channel_id": 567}},
         )
+
+    def test_parses_per_ticket_categories(self):
+        configs = parse_ticket_category_configs(
+            '{"123": {"general_support": "789", "bug_report": 987}}'
+        )
+
+        self.assertEqual(configs, {"123": {"general_support": 789, "bug_report": 987}})
 
     def test_rejects_missing_panel_channel(self):
         with self.assertRaisesRegex(RuntimeError, "must include a channel_id"):
@@ -103,8 +111,9 @@ class TicketCreationTests(unittest.IsolatedAsyncioTestCase):
             os.environ,
             {
                 "TICKET_GUILD_CONFIGS": (
-                    '{"123": {"channel_id": 456, "category_id": 789}}'
+                    '{"123": {"channel_id": 456}}'
                 ),
+                "TICKET_CATEGORY_CONFIGS": '{"123": {"bug_report": 789}}',
                 "TICKET_STATE_PATH": os.devnull,
             },
         ):
@@ -123,6 +132,7 @@ class TicketCreationTests(unittest.IsolatedAsyncioTestCase):
             default_role=Mock(),
             me=None,
             get_channel=Mock(return_value=category),
+            channels=[],
             create_text_channel=AsyncMock(return_value=ticket_channel),
         )
         interaction = SimpleNamespace(
@@ -145,7 +155,7 @@ class TicketCreationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(create_kwargs["category"], category)
         send_kwargs = ticket_channel.send.await_args.kwargs
         self.assertEqual(send_kwargs["embed"].fields[0].name, "How did this bug first occur?")
-        self.assertEqual(send_kwargs["embed"].fields[0].value, "After restart")
+        self.assertEqual(send_kwargs["embed"].fields[0].value, "*After restart*")
         self.assertEqual([upload.filename for upload in send_kwargs["files"]], ["crash.txt"])
         self.assertEqual(send_kwargs["files"][0].fp.read(), b"log data")
 
@@ -186,15 +196,42 @@ class TicketPanelStartupTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(cog, "_configured_channel", new=AsyncMock(return_value=Channel())):
             await cog.upsert_panel(guild)
 
-        self.assertEqual(posted["embed"].title, "Ticket types:")
+        self.assertEqual(posted["embed"].title, "Make a ticket:")
+        self.assertEqual(
+            posted["embed"].description,
+            "Should you need assistance with anything, create a ticket below. "
+            "Our staff will get to your ticket as soon as possible; Please be patient. ",
+        )
         self.assertIsNone(posted["view"].timeout)
-        self.assertEqual(posted["view"].children[0].label, "General Support")
+        self.assertEqual(
+            [button.label for button in posted["view"].children],
+            [
+                "General Support",
+                "Whitelist Submission",
+                "Warfare",
+                "Rulebreak Report",
+                "Admin Report",
+                "Bug Report",
+                "Compensation Request",
+            ],
+        )
         self.assertEqual(
             [button.style for button in posted["view"].children],
-            [discord.ButtonStyle.secondary, discord.ButtonStyle.secondary],
+            [discord.ButtonStyle.secondary] * 7,
         )
+        self.assertEqual(posted["view"].children[0].emoji.name, "❓")
+        self.assertEqual(posted["view"].children[5].emoji.name, "🪲")
         self.assertEqual(posted["embed"].footer.text, "STALKER: Lost Zone Ticket Bot - Stalker Support")
         self.assertEqual(GeneralSupportModal(cog).children[0].text, "Describe your issue:")
+        self.assertEqual(
+            [item.text for item in BugReportModal(cog).children[:-1]],
+            [
+                "How did this bug first occur?",
+                "Did you lose anything as a result of the bug?",
+                "Is this bug repeatable?",
+                "Additional Comments? (Put N/A if no)",
+            ],
+        )
 
 
 if __name__ == "__main__":
