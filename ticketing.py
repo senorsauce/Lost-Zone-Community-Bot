@@ -135,36 +135,6 @@ def validate_upload_extension(filename: str) -> bool:
     return os.path.splitext(filename)[1].lower() in ALLOWED_FILE_EXTENSIONS
 
 
-def prepare_named_uploads(
-    names_text: str, uploads: list[dict[str, Any]]
-) -> tuple[list[dict[str, Any]] | None, str | None]:
-    names = [name.strip() for name in names_text.splitlines()]
-    if len(names) != len(uploads) or any(not name for name in names):
-        return None, f"Enter exactly {len(uploads)} non-empty filename(s), one per line."
-
-    prepared: list[dict[str, Any]] = []
-    seen_names: set[str] = set()
-    for name, upload in zip(names, uploads):
-        original_extension = os.path.splitext(upload["original_name"])[1].lower()
-        if not validate_upload_extension(upload["original_name"]):
-            return None, f"Unsupported file format: {upload['original_name']}"
-        if "/" in name or "\\" in name or "\0" in name or name in {".", ".."}:
-            return None, "File names cannot contain path separators."
-        if not os.path.splitext(name)[1]:
-            name += original_extension
-        extension = os.path.splitext(name)[1].lower()
-        if extension not in ALLOWED_FILE_EXTENSIONS or extension != original_extension:
-            return None, f"Use the original accepted file extension for {upload['original_name']}."
-        if len(name) > 100:
-            return None, "File names must be 100 characters or fewer."
-        if name.casefold() in seen_names:
-            return None, "Each uploaded file needs a unique name."
-        seen_names.add(name.casefold())
-        prepared.append({"filename": name, "data": upload["data"]})
-
-    return prepared, None
-
-
 def parse_ticket_guild_configs(raw: str) -> dict[str, dict[str, int]]:
     if not raw.strip():
         return {}
@@ -368,58 +338,6 @@ class GeneralSupportModal(TicketSubmissionModal):
 class BugReportModal(TicketSubmissionModal):
     def __init__(self, cog: "TicketingCog"):
         super().__init__(cog, "bug_report")
-
-
-class FileNamingView(discord.ui.View):
-    def __init__(self, cog: "TicketingCog", pending: dict[str, Any]):
-        super().__init__(timeout=180)
-        self.add_item(FileNamingButton(cog, pending))
-
-
-class FileNamingButton(discord.ui.Button):
-    def __init__(self, cog: "TicketingCog", pending: dict[str, Any]):
-        super().__init__(label="Name uploaded files", style=discord.ButtonStyle.secondary)
-        self.cog = cog
-        self.pending = pending
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        await interaction.response.send_modal(FileNamingModal(self.cog, self.pending))
-
-
-class FileNamingModal(discord.ui.Modal, title="Name uploaded files"):
-    def __init__(self, cog: "TicketingCog", pending: dict[str, Any]):
-        super().__init__()
-        self.cog = cog
-        self.pending = pending
-        self.names = discord.ui.Label(
-            text="File names",
-            description="One name per line, in upload order. Keep each file's original extension.",
-            component=discord.ui.TextInput(
-                style=discord.TextStyle.paragraph,
-                placeholder="Example: evidence.jpg",
-                max_length=1000,
-            ),
-        )
-        self.add_item(self.names)
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        uploads, error = prepare_named_uploads(
-            self.names.component.value,
-            self.pending["uploads"],
-        )
-        if error:
-            await interaction.response.send_message(
-                f"{error} Please enter one filename per line.",
-                view=FileNamingView(self.cog, self.pending),
-                ephemeral=True,
-            )
-            return
-        await self.cog.create_ticket(
-            interaction,
-            self.pending["answers"],
-            self.pending["ticket_type"],
-            uploads or [],
-        )
 
 
 class TicketConfigView(discord.ui.View):
@@ -654,19 +572,7 @@ class TicketingCog(commands.Cog):
         ticket_type_key: str,
         uploads: list[dict[str, Any]],
     ) -> None:
-        if uploads:
-            pending = {
-                "ticket_type": ticket_type_key,
-                "answers": answers,
-                "uploads": uploads,
-            }
-            await interaction.response.send_message(
-                f"Upload received. Name each of the {len(uploads)} file(s) in upload order.",
-                view=FileNamingView(self, pending),
-                ephemeral=True,
-            )
-            return
-        await self.create_ticket(interaction, answers, ticket_type_key, [])
+        await self.create_ticket(interaction, answers, ticket_type_key, uploads)
 
     async def create_ticket(
         self,
@@ -774,12 +680,20 @@ class TicketingCog(commands.Cog):
                 reason=f"{ticket_type_config['label']} ticket created",
             )
             opening_embed = discord.Embed(
+                title=ticket_type_config["label"],
                 description=(
                     f"{requester.mention} has opened a "
                     f"{ticket_type_config['category_name']} ticket."
                 ),
                 colour=discord.Colour(0x3C3CE8),
             )
+            display_name = getattr(requester, "display_name", requester.name)
+            avatar = getattr(requester, "display_avatar", None)
+            opening_embed.set_author(
+                name=display_name,
+                icon_url=getattr(avatar, "url", None),
+            )
+            opening_embed.set_footer(text=PANEL_FOOTER)
             for question in ticket_type_config["questions"]:
                 answer = answers.get(question["label"], "")
                 opening_embed.add_field(

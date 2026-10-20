@@ -10,9 +10,9 @@ from ticketing import (
     GeneralSupportModal,
     TicketPanelView,
     TicketingCog,
-    prepare_named_uploads,
     parse_ticket_category_configs,
     parse_ticket_guild_configs,
+    validate_upload_extension,
 )
 
 
@@ -56,53 +56,14 @@ class TicketUploadTests(unittest.TestCase):
         self.assertEqual(modal.children[-1].text, "Upload files")
         self.assertEqual(modal.children[-1].component.max_values, 10)
 
-    def test_upload_names_are_unique_and_keep_allowed_extension(self):
-        named_uploads, error = prepare_named_uploads(
-            "Server evidence\nreport.json",
-            [
-                {"original_name": "evidence.PNG", "data": b"image"},
-                {"original_name": "upload.json", "data": b"{}"},
-            ],
-        )
+    def test_upload_extension_validation_accepts_only_supported_formats(self):
+        for extension in (".jpg", ".png", ".json", ".zip", ".txt", ".mp3", ".mp4"):
+            with self.subTest(extension=extension):
+                self.assertTrue(validate_upload_extension(f"evidence{extension}"))
 
-        self.assertIsNone(error)
-        self.assertEqual(
-            named_uploads,
-            [
-                {"filename": "Server evidence.png", "data": b"image"},
-                {"filename": "report.json", "data": b"{}"},
-            ],
-        )
-
-    def test_rejects_unsupported_extensions_and_duplicate_names(self):
-        unsupported, unsupported_error = prepare_named_uploads(
-            "malware.exe", [{"original_name": "upload.exe", "data": b"x"}]
-        )
-        duplicates, duplicate_error = prepare_named_uploads(
-            "evidence.jpg\nEVIDENCE.JPG",
-            [
-                {"original_name": "one.jpg", "data": b"1"},
-                {"original_name": "two.jpg", "data": b"2"},
-            ],
-        )
-
-        self.assertIsNone(unsupported)
-        self.assertIn("Unsupported file format", unsupported_error)
-        self.assertIsNone(duplicates)
-        self.assertIn("unique name", duplicate_error)
-
-    def test_requires_a_name_per_file_and_matching_extension(self):
-        missing_name, missing_error = prepare_named_uploads(
-            "", [{"original_name": "evidence.jpg", "data": b"x"}]
-        )
-        changed_extension, extension_error = prepare_named_uploads(
-            "evidence.png", [{"original_name": "evidence.jpg", "data": b"x"}]
-        )
-
-        self.assertIsNone(missing_name)
-        self.assertIn("exactly 1", missing_error)
-        self.assertIsNone(changed_extension)
-        self.assertIn("original accepted file extension", extension_error)
+        for filename in ("evidence.exe", "no-extension", "evidence.jpg.exe"):
+            with self.subTest(filename=filename):
+                self.assertFalse(validate_upload_extension(filename))
 
 
 class TicketCreationTests(unittest.IsolatedAsyncioTestCase):
@@ -158,9 +119,28 @@ class TicketCreationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(send_kwargs["embed"].fields[0].value, "*After restart*")
         self.assertEqual([upload.filename for upload in send_kwargs["files"]], ["crash.txt"])
         self.assertEqual(send_kwargs["files"][0].fp.read(), b"log data")
+        self.assertEqual(send_kwargs["embed"].footer.text, "STALKER: Lost Zone Ticket Bot - Stalker Support")
+        self.assertTrue(send_kwargs["embed"].title)
 
 
 class TicketPanelStartupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_every_ticket_button_opens_a_valid_upload_modal(self):
+        bot = SimpleNamespace(add_view=Mock())
+        with patch.dict(os.environ, {"TICKET_STATE_PATH": os.devnull}):
+            cog = TicketingCog(bot)
+        view = TicketPanelView(cog, 123)
+
+        self.assertEqual(len(view.children), 7)
+        for button in view.children:
+            with self.subTest(ticket=button.label):
+                response = SimpleNamespace(send_modal=AsyncMock())
+                await button.callback(SimpleNamespace(response=response))
+
+                modal = response.send_modal.await_args.args[0]
+                self.assertIsInstance(modal, discord.ui.Modal)
+                self.assertLessEqual(len(modal.children), 5)
+                self.assertIsInstance(modal.children[-1].component, discord.ui.FileUpload)
+
     async def test_missing_guild_config_is_logged(self):
         with patch.dict(
             os.environ,
