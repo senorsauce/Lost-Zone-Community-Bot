@@ -13,9 +13,9 @@ logger = logging.getLogger(__name__)
 SUGGESTION_CHANNEL_ID = int(
     os.getenv("SUGGESTION_CHANNEL_ID", "1531432683702456411")
 )
-SUGGESTION_FOOTER = "zvtbot-suggestion-v1"
 ALLOWED_REACTIONS = {"✅", "❌"}
-SUGGESTION_NUMBER_PATTERN = re.compile(r"^Suggestion #(\d+)$")
+SUGGESTION_NUMBER_PATTERN = re.compile(r"^#(\d{2,})$")
+LEGACY_SUGGESTION_NUMBER_PATTERN = re.compile(r"^Suggestion #(\d+)$")
 
 
 class SuggestionCog(commands.Cog):
@@ -48,9 +48,7 @@ class SuggestionCog(commands.Cog):
             async for message in channel.history(limit=None, oldest_first=False):
                 if message.author != self.bot.user or not message.embeds:
                     continue
-                match = SUGGESTION_NUMBER_PATTERN.fullmatch(
-                    message.embeds[0].title or ""
-                )
+                match = self._suggestion_number_match(message.embeds[0].title or "")
                 if match:
                     highest_number = max(highest_number, int(match.group(1)))
             self._suggestion_number = highest_number
@@ -58,6 +56,20 @@ class SuggestionCog(commands.Cog):
 
         self._suggestion_number += 1
         return self._suggestion_number
+
+    @staticmethod
+    def _suggestion_number_match(title: str) -> re.Match[str] | None:
+        return (
+            SUGGESTION_NUMBER_PATTERN.fullmatch(title)
+            or LEGACY_SUGGESTION_NUMBER_PATTERN.fullmatch(title)
+        )
+
+    def _is_suggestion_message(self, message: discord.Message) -> bool:
+        return bool(
+            message.author == self.bot.user
+            and message.embeds
+            and self._suggestion_number_match(message.embeds[0].title or "")
+        )
 
     @app_commands.command(
         name="suggest",
@@ -90,11 +102,10 @@ class SuggestionCog(commands.Cog):
             try:
                 suggestion_number = await self._next_suggestion_number(channel)
                 embed = discord.Embed(
-                    title=f"Suggestion #{suggestion_number:04d}",
+                    title=f"#{suggestion_number:02d}",
                     description=suggestion,
                     colour=discord.Colour(0x3C3CE8),
                 )
-                embed.set_footer(text=SUGGESTION_FOOTER)
                 message = await channel.send(
                     embed=embed,
                     allowed_mentions=discord.AllowedMentions.none(),
@@ -121,7 +132,7 @@ class SuggestionCog(commands.Cog):
                     )
                     failed_reactions.append(emoji)
 
-        reply = f"Your suggestion was posted as Suggestion #{suggestion_number:04d}."
+        reply = f"Your suggestion was posted as #{suggestion_number:02d}."
         if failed_reactions:
             reply += " The bot could not add all voting reactions; check its Add Reactions permission."
         await interaction.followup.send(reply, ephemeral=True)
@@ -154,10 +165,7 @@ class SuggestionCog(commands.Cog):
             except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
                 logger.warning("Could not fetch message for reaction filtering: %s", exc)
                 return
-        if (
-            not message.embeds
-            or message.embeds[0].footer.text != SUGGESTION_FOOTER
-        ):
+        if not self._is_suggestion_message(message):
             return
 
         member = payload.member
