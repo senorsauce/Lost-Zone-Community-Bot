@@ -11,7 +11,6 @@ import discord
 from ticketing import (
     BugReportModal,
     CloseRequestModal,
-    EVIDENCE_ACKNOWLEDGMENT,
     GeneralSupportModal,
     TicketAcknowledgmentModal,
     TicketAcknowledgmentView,
@@ -317,9 +316,40 @@ class TicketPanelStartupTests(unittest.IsolatedAsyncioTestCase):
         acknowledgment_modal = button_response.send_modal.await_args.args[0]
         self.assertIsInstance(acknowledgment_modal, TicketAcknowledgmentModal)
         self.assertEqual(
-            acknowledgment_modal.children[0].content,
-            EVIDENCE_ACKNOWLEDGMENT,
+            acknowledgment_modal.children[0].text,
+            "Required confirmation",
         )
+        confirmation = acknowledgment_modal.children[0].component
+        self.assertTrue(confirmation.required)
+        self.assertEqual(confirmation.min_values, 1)
+        self.assertEqual(
+            [option.label for option in confirmation.options],
+            [TICKET_TYPES["compensation_request"]["acknowledgment"]],
+        )
+
+    async def test_evidence_checkbox_text_matches_each_report_type(self):
+        expected = {
+            "rulebreaks": (
+                "I have proof to back up my claims, and this submission is in good faith."
+            ),
+            "admin_reports": (
+                "I have proof to back up my claims, and this submission is in good faith."
+            ),
+            "compensation_request": "I have proof of the situation.",
+        }
+
+        for ticket_type, checkbox_text in expected.items():
+            with self.subTest(ticket_type=ticket_type):
+                acknowledgment = TICKET_TYPES[ticket_type]["acknowledgment"]
+                self.assertEqual(acknowledgment, checkbox_text)
+                modal = TicketAcknowledgmentModal(
+                    SimpleNamespace(), ticket_type, {}, acknowledgment
+                )
+                self.assertEqual(
+                    modal.children[0].component.options[0].label,
+                    checkbox_text,
+                )
+                modal.to_dict()
 
     async def test_every_ticket_button_opens_a_valid_upload_modal(self):
         bot = SimpleNamespace(add_view=Mock())
@@ -330,10 +360,27 @@ class TicketPanelStartupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(view.children), 7)
         for button in view.children:
             with self.subTest(ticket=button.label):
-                response = SimpleNamespace(send_modal=AsyncMock())
+                response = SimpleNamespace(
+                    send_modal=AsyncMock(),
+                    send_message=AsyncMock(),
+                )
                 await button.callback(SimpleNamespace(response=response))
 
-                modal = response.send_modal.await_args.args[0]
+                if TICKET_TYPES[button.ticket_type_key].get("precursor"):
+                    response.send_message.assert_awaited_once()
+                    precursor_embed = response.send_message.await_args.kwargs["embed"]
+                    self.assertEqual(
+                        precursor_embed.description,
+                        TICKET_TYPES[button.ticket_type_key]["precursor"],
+                    )
+                    continue_response = SimpleNamespace(send_modal=AsyncMock())
+                    precursor_view = response.send_message.await_args.kwargs["view"]
+                    await precursor_view.children[0].callback(
+                        SimpleNamespace(response=continue_response)
+                    )
+                    modal = continue_response.send_modal.await_args.args[0]
+                else:
+                    modal = response.send_modal.await_args.args[0]
                 self.assertIsInstance(modal, discord.ui.Modal)
                 self.assertLessEqual(len(modal.children), 5)
                 for index, (question, _) in enumerate(modal.question_fields):
@@ -345,6 +392,37 @@ class TicketPanelStartupTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(rendered_question, question)
                 self.assertIsInstance(modal.children[-1].component, discord.ui.FileUpload)
                 modal.to_dict()
+
+    async def test_category_precursors_match_requested_copy(self):
+        expected = {
+            "general_support": (
+                "Please ensure your ticket does not fit into one of the other categories before making a general submission. "
+                "This organization serves to speed up response times and as a result, your ticket will take longer to be resolved."
+            ),
+            "whitelist_submission": (
+                "Low effort whitelists will be met with immediate denial. Though lengthy answers are not required, they are encouraged, "
+                "and may be used in decision making in the future. Read the rules prior to applying."
+            ),
+            "rulebreaks": (
+                "By submitting a rulebreak ticket, you are accusing another player of breaking server rules, which may lead to that player "
+                "incurring penalty. Though these matters are always thoroughly and seriously investigated, you must provide ample proof of all allegations."
+            ),
+            "admin_reports": (
+                "By submitting an admin report, you are accusing a staff member of breaching the player bases' trust. Though these matters are "
+                "always thoroughly and seriously investigated, you must provide ample proof of all allegations."
+            ),
+            "bug_report": (
+                "Please be as thorough as possible when describing your bug to better help developers fix it ASAP."
+            ),
+            "compensation_request": (
+                "Our staff would like to rectify any situation which you believe to be unfair. As such, please provide thorough proof of the situation."
+            ),
+        }
+
+        self.assertEqual(
+            {key: config["precursor"] for key, config in TICKET_TYPES.items() if "precursor" in config},
+            expected,
+        )
 
     async def test_missing_guild_config_is_logged(self):
         with patch.dict(

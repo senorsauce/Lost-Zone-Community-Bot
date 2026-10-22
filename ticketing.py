@@ -19,15 +19,14 @@ CLOSE_REQUEST_FOOTER = "ticket-close-request-v1"
 DEFAULT_TRANSCRIPT_CHANNEL_ID = 1562225728651657337
 DEFAULT_TRANSCRIPT_CATEGORY_ID = 1522884583471714324
 ALLOWED_FILE_EXTENSIONS = {".jpg", ".png", ".json", ".zip", ".txt", ".mp3", ".mp4"}
-EVIDENCE_ACKNOWLEDGMENT = (
-    "Do you understand that without providing evidence of the situation, that "
-    "there is little staff can do for you, and therefore are not entitled to a "
-    "satisfying resolution?"
-)
-
 TICKET_TYPES = {
     "general_support": {
         "label": "General Support",
+        "precursor": (
+            "Please ensure your ticket does not fit into one of the other categories "
+            "before making a general submission. This organization serves to speed up "
+            "response times and as a result, your ticket will take longer to be resolved."
+        ),
         "emoji": "❓",
         "category_name": "General",
         "modal_title": "General Support",
@@ -43,6 +42,11 @@ TICKET_TYPES = {
     },
     "whitelist_submission": {
         "label": "Whitelist Submission",
+        "precursor": (
+            "Low effort whitelists will be met with immediate denial. Though lengthy "
+            "answers are not required, they are encouraged, and may be used in decision "
+            "making in the future. Read the rules prior to applying."
+        ),
         "emoji": "✍️",
         "category_name": "Whitelist",
         "modal_title": "Whitelist Submission",
@@ -69,6 +73,12 @@ TICKET_TYPES = {
     },
     "rulebreaks": {
         "label": "Rulebreak Report",
+        "precursor": (
+            "By submitting a rulebreak ticket, you are accusing another player of "
+            "breaking server rules, which may lead to that player incurring penalty. "
+            "Though these matters are always thoroughly and seriously investigated, "
+            "you must provide ample proof of all allegations."
+        ),
         "emoji": "❌",
         "category_name": "Rulebreaks",
         "modal_title": "Rulebreak Report",
@@ -83,10 +93,18 @@ TICKET_TYPES = {
                 "max_length": 2000,
             },
         ],
-        "acknowledgment": EVIDENCE_ACKNOWLEDGMENT,
+        "acknowledgment": (
+            "I have proof to back up my claims, and this submission is in good faith."
+        ),
     },
     "admin_reports": {
         "label": "Admin Report",
+        "precursor": (
+            "By submitting an admin report, you are accusing a staff member of "
+            "breaching the player bases' trust. Though these matters are always "
+            "thoroughly and seriously investigated, you must provide ample proof of "
+            "all allegations."
+        ),
         "emoji": "🚨",
         "category_name": "Admin Reports",
         "modal_title": "Admin Report",
@@ -100,10 +118,16 @@ TICKET_TYPES = {
                 "max_length": 2000,
             },
         ],
-        "acknowledgment": EVIDENCE_ACKNOWLEDGMENT,
+        "acknowledgment": (
+            "I have proof to back up my claims, and this submission is in good faith."
+        ),
     },
     "bug_report": {
         "label": "Bug Report",
+        "precursor": (
+            "Please be as thorough as possible when describing your bug to better "
+            "help developers fix it ASAP."
+        ),
         "emoji": "🪲",
         "category_name": "Bug Report",
         "modal_title": "Bug Report",
@@ -120,6 +144,10 @@ TICKET_TYPES = {
     },
     "compensation_request": {
         "label": "Compensation Request",
+        "precursor": (
+            "Our staff would like to rectify any situation which you believe to be "
+            "unfair. As such, please provide thorough proof of the situation."
+        ),
         "emoji": "🪙",
         "category_name": "Compensation Request",
         "modal_title": "Compensation Request",
@@ -131,7 +159,7 @@ TICKET_TYPES = {
             },
             {"label": "How did the loss occur?", "max_length": 1000},
         ],
-        "acknowledgment": EVIDENCE_ACKNOWLEDGMENT,
+        "acknowledgment": "I have proof of the situation.",
     },
 }
 
@@ -235,6 +263,19 @@ class TicketPanelButton(discord.ui.Button):
         self.ticket_type_key = ticket_type
 
     async def callback(self, interaction: discord.Interaction) -> None:
+        config = TICKET_TYPES[self.ticket_type_key]
+        if config.get("precursor"):
+            embed = discord.Embed(
+                title=config["label"],
+                description=config["precursor"],
+                colour=discord.Colour(0x3C3CE8),
+            )
+            await interaction.response.send_message(
+                embed=embed,
+                view=TicketPrecursorView(self.cog, self.ticket_type_key),
+                ephemeral=True,
+            )
+            return
         try:
             await interaction.response.send_modal(
                 TicketSubmissionModal(self.cog, self.ticket_type_key)
@@ -242,6 +283,34 @@ class TicketPanelButton(discord.ui.Button):
         except Exception:
             logger.exception(
                 "Could not open %s ticket form.", self.ticket_type_key
+            )
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "The ticket form could not be opened. Please try again.",
+                    ephemeral=True,
+                )
+
+
+class TicketPrecursorView(discord.ui.View):
+    def __init__(self, cog: "TicketingCog", ticket_type: str):
+        super().__init__(timeout=180)
+        self.add_item(TicketPrecursorButton(cog, ticket_type))
+
+
+class TicketPrecursorButton(discord.ui.Button):
+    def __init__(self, cog: "TicketingCog", ticket_type: str):
+        super().__init__(label="Continue", style=discord.ButtonStyle.secondary)
+        self.cog = cog
+        self.ticket_type = ticket_type
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        try:
+            await interaction.response.send_modal(
+                TicketSubmissionModal(self.cog, self.ticket_type)
+            )
+        except (discord.HTTPException, ValueError):
+            logger.exception(
+                "Could not open %s ticket form after precursor.", self.ticket_type
             )
             if not interaction.response.is_done():
                 await interaction.response.send_message(
@@ -355,12 +424,29 @@ class TicketAcknowledgmentModal(discord.ui.Modal, title="Final Acknowledgment"):
         self.ticket_type_key = ticket_type_key
         self.answers = answers
         self.uploads = uploads or []
-        self.add_item(discord.ui.TextDisplay(content=acknowledgment))
-        self.answer = discord.ui.TextInput(style=discord.TextStyle.short, max_length=500)
-        self.add_item(discord.ui.Label(text="Your response:", component=self.answer))
+        self.confirmation = discord.ui.CheckboxGroup(
+            required=True,
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.CheckboxGroupOption(
+                    label=acknowledgment,
+                    value="confirmed",
+                )
+            ],
+        )
+        self.add_item(
+            discord.ui.Label(text="Required confirmation", component=self.confirmation)
+        )
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        self.answers[EVIDENCE_ACKNOWLEDGMENT] = self.answer.value
+        if "confirmed" not in self.confirmation.values:
+            await interaction.response.send_message(
+                "You must check the proof confirmation before submitting.",
+                ephemeral=True,
+            )
+            return
+        self.answers[TICKET_TYPES[self.ticket_type_key]["acknowledgment"]] = "Confirmed"
         await self.cog.finish_ticket_submission(
             interaction,
             self.answers,

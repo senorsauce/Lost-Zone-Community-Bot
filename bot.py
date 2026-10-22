@@ -7,6 +7,7 @@ from radio import RadioCog
 from dayz import DayzCog
 from announcement import AnnouncementCog
 from ticketing import TicketingCog
+from suggestions import SuggestionCog
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("ZVTBOT")
@@ -40,6 +41,7 @@ async def main() -> None:
     await bot.add_cog(DayzCog(bot))
     await bot.add_cog(AnnouncementCog(bot))
     await bot.add_cog(TicketingCog(bot))
+    await bot.add_cog(SuggestionCog(bot))
     await bot.start(TOKEN)
 
 
