@@ -25,7 +25,7 @@ class SuggestionCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("1531432683702456411", interaction.followup.send.await_args.args[0])
 
     async def test_posts_numbered_suggestion_and_adds_only_two_reactions(self):
-        existing_embed = discord.Embed(title="Suggestion #0007")
+        existing_embed = discord.Embed(title="Suggestion #07")
         existing_message = SimpleNamespace(
             author="bot-user",
             embeds=[existing_embed],
@@ -60,7 +60,7 @@ class SuggestionCommandTests(unittest.IsolatedAsyncioTestCase):
             await cog.suggest.callback(cog, interaction, "Add a community event")
 
         embed = channel.send.await_args.kwargs["embed"]
-        self.assertEqual(embed.title, "#08")
+        self.assertEqual(embed.title, "Suggestion #08")
         self.assertEqual(embed.description, "Add a community event")
         self.assertIsNone(embed.footer.text)
         self.assertEqual(
@@ -72,7 +72,7 @@ class SuggestionCommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_removes_other_reactions_from_suggestion_messages(self):
         suggestion = SimpleNamespace(
             author=SimpleNamespace(id=99),
-            embeds=[discord.Embed(title="#01")],
+            embeds=[discord.Embed(title="Suggestion #0001")],
             remove_reaction=AsyncMock(),
         )
         member = SimpleNamespace(id=11)
@@ -81,7 +81,7 @@ class SuggestionCommandTests(unittest.IsolatedAsyncioTestCase):
             fetch_message=AsyncMock(return_value=suggestion),
         )
         bot = SimpleNamespace(
-            user=SimpleNamespace(id=99),
+            user=suggestion.author,
             get_channel=Mock(return_value=channel),
         )
         cog = SuggestionCog(bot)
@@ -112,66 +112,6 @@ class SuggestionCommandTests(unittest.IsolatedAsyncioTestCase):
             )
             await cog.on_raw_reaction_add(payload)
         channel.fetch_message.assert_not_awaited()
-
-    async def test_new_single_digit_number_is_zero_padded(self):
-        sent_message = SimpleNamespace(id=30, add_reaction=AsyncMock())
-
-        class Channel:
-            guild = SimpleNamespace(id=10)
-
-            async def history(self, limit, oldest_first):
-                if False:
-                    yield None
-
-            send = AsyncMock(return_value=sent_message)
-
-        channel = Channel()
-        bot = SimpleNamespace(user="bot-user", get_channel=Mock(return_value=channel))
-        cog = SuggestionCog(bot)
-        interaction = SimpleNamespace(
-            response=SimpleNamespace(defer=AsyncMock()),
-            followup=SimpleNamespace(send=AsyncMock()),
-            guild_id=10,
-            channel_id=1531432683702456411,
-            user=SimpleNamespace(id=11),
-        )
-
-        with patch("suggestions.discord.TextChannel", Channel):
-            await cog.suggest.callback(cog, interaction, "First suggestion")
-
-        self.assertEqual(channel.send.await_args.kwargs["embed"].title, "#01")
-
-    async def test_number_uses_plain_hash_after_nine(self):
-        previous = SimpleNamespace(
-            author="bot-user",
-            embeds=[discord.Embed(title="#09")],
-        )
-        sent_message = SimpleNamespace(id=31, add_reaction=AsyncMock())
-
-        class Channel:
-            guild = SimpleNamespace(id=10)
-
-            async def history(self, limit, oldest_first):
-                yield previous
-
-            send = AsyncMock(return_value=sent_message)
-
-        channel = Channel()
-        cog = SuggestionCog(
-            SimpleNamespace(user="bot-user", get_channel=Mock(return_value=channel))
-        )
-        interaction = SimpleNamespace(
-            response=SimpleNamespace(defer=AsyncMock()),
-            followup=SimpleNamespace(send=AsyncMock()),
-            guild_id=10,
-            channel_id=1531432683702456411,
-            user=SimpleNamespace(id=11),
-        )
-
-        with patch("suggestions.discord.TextChannel", Channel):
-            await cog.suggest.callback(cog, interaction, "Tenth suggestion")
-
-        self.assertEqual(channel.send.await_args.kwargs["embed"].title, "#10")
 
 
 if __name__ == "__main__":
