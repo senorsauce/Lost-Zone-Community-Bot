@@ -345,20 +345,50 @@ class TicketSubmissionModal(discord.ui.Modal):
             )
             self.question_fields.append((question["label"], field))
 
-        self.upload_field = discord.ui.Label(
-            text="Upload files",
-            description="Optional. Accepted: .jpg, .png, .json, .zip, .txt, .mp3, .mp4",
-            component=discord.ui.FileUpload(
+        self.confirmation = None
+        if acknowledgment := config.get("acknowledgment"):
+            self.confirmation = discord.ui.CheckboxGroup(
+                required=True,
+                min_values=1,
+                max_values=1,
+                options=[
+                    discord.CheckboxGroupOption(
+                        label=acknowledgment,
+                        value="confirmed",
+                    )
+                ],
+            )
+        self.upload_field = None
+        if ticket_type != "rulebreaks":
+            self.upload_field = discord.ui.FileUpload(
                 required=False,
                 min_values=0,
                 max_values=10,
-            ),
-        )
-        self.add_item(self.upload_field)
+            )
+            self.add_item(
+                discord.ui.Label(
+                    text="Upload files",
+                    description="Optional. Accepted: .jpg, .png, .json, .zip, .txt, .mp3, .mp4",
+                    component=self.upload_field,
+                )
+            )
+        if self.confirmation is not None:
+            self.add_item(
+                discord.ui.Label(
+                    text="Required confirmation",
+                    component=self.confirmation,
+                )
+            )
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         answers = {label: field.value for label, field in self.question_fields}
-        attachments = self.upload_field.component.values
+        if self.confirmation is not None and "confirmed" not in self.confirmation.values:
+            await interaction.response.send_message(
+                "Check the proof confirmation before submitting.", ephemeral=True
+            )
+            return
+
+        attachments = self.upload_field.values if self.upload_field is not None else []
         invalid_files = [
             attachment.filename
             for attachment in attachments
@@ -390,125 +420,108 @@ class TicketSubmissionModal(discord.ui.Modal):
             )
             return
 
-        acknowledgment = TICKET_TYPES[self.ticket_type].get("acknowledgment")
-        if acknowledgment:
+        ticket_channel = await self.cog.finish_ticket_submission(
+            interaction, answers, self.ticket_type, uploads
+        )
+        if self.ticket_type == "rulebreaks" and ticket_channel is not None:
             await interaction.followup.send(
-                "Please confirm the evidence acknowledgment to continue.",
-                view=TicketAcknowledgmentView(
+                "Ticket submitted. Attach proof files here if needed.",
+                view=RulebreakEvidenceUploadView(
                     self.cog,
-                    self.ticket_type,
-                    answers,
-                    acknowledgment,
-                    uploads,
+                    ticket_channel.id,
+                    interaction.user.id,
                 ),
                 ephemeral=True,
             )
-            return
-
-        await self.cog.finish_ticket_submission(
-            interaction, answers, self.ticket_type, uploads
-        )
 
 
-class TicketAcknowledgmentModal(discord.ui.Modal, title="Final Acknowledgment"):
-    def __init__(
-        self,
-        cog: "TicketingCog",
-        ticket_type_key: str,
-        answers: dict[str, str],
-        acknowledgment: str,
-        uploads: list[dict[str, Any]] | None = None,
-    ):
-        super().__init__()
+class RulebreakEvidenceUploadView(discord.ui.View):
+    def __init__(self, cog: "TicketingCog", channel_id: int, owner_id: int):
+        super().__init__(timeout=600)
+        self.add_item(RulebreakEvidenceUploadButton(cog, channel_id, owner_id))
+
+
+class RulebreakEvidenceUploadButton(discord.ui.Button):
+    def __init__(self, cog: "TicketingCog", channel_id: int, owner_id: int):
+        super().__init__(label="Attach proof files", style=discord.ButtonStyle.secondary)
         self.cog = cog
-        self.ticket_type_key = ticket_type_key
-        self.answers = answers
-        self.uploads = uploads or []
-        self.confirmation = discord.ui.CheckboxGroup(
-            required=True,
-            min_values=1,
-            max_values=1,
-            options=[
-                discord.CheckboxGroupOption(
-                    label=acknowledgment,
-                    value="confirmed",
-                )
-            ],
-        )
-        self.add_item(
-            discord.ui.Label(text="Required confirmation", component=self.confirmation)
-        )
+        self.channel_id = channel_id
+        self.owner_id = owner_id
 
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        if "confirmed" not in self.confirmation.values:
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.owner_id:
             await interaction.response.send_message(
-                "You must check the proof confirmation before submitting.",
+                "Only the ticket opener can attach evidence from this prompt.",
                 ephemeral=True,
             )
             return
-        self.answers[TICKET_TYPES[self.ticket_type_key]["acknowledgment"]] = "Confirmed"
-        await self.cog.finish_ticket_submission(
-            interaction,
-            self.answers,
-            self.ticket_type_key,
-            self.uploads,
+        await interaction.response.send_modal(
+            RulebreakEvidenceUploadModal(self.cog, self.channel_id, self.owner_id)
         )
 
 
-class TicketAcknowledgmentView(discord.ui.View):
-    def __init__(
-        self,
-        cog: "TicketingCog",
-        ticket_type_key: str,
-        answers: dict[str, str],
-        acknowledgment: str,
-        uploads: list[dict[str, Any]],
-    ):
-        super().__init__(timeout=180)
-        self.add_item(
-            TicketAcknowledgmentButton(
-                cog, ticket_type_key, answers, acknowledgment, uploads
-            )
-        )
-
-
-class TicketAcknowledgmentButton(discord.ui.Button):
-    def __init__(
-        self,
-        cog: "TicketingCog",
-        ticket_type_key: str,
-        answers: dict[str, str],
-        acknowledgment: str,
-        uploads: list[dict[str, Any]],
-    ):
-        super().__init__(label="Continue", style=discord.ButtonStyle.secondary)
+class RulebreakEvidenceUploadModal(discord.ui.Modal, title="Attach Proof Files"):
+    def __init__(self, cog: "TicketingCog", channel_id: int, owner_id: int):
+        super().__init__()
         self.cog = cog
-        self.ticket_type_key = ticket_type_key
-        self.answers = answers
-        self.acknowledgment = acknowledgment
-        self.uploads = uploads
+        self.channel_id = channel_id
+        self.owner_id = owner_id
+        self.files = discord.ui.Label(
+            text="Proof files",
+            description="Accepted: .jpg, .png, .json, .zip, .txt, .mp3, .mp4",
+            component=discord.ui.FileUpload(required=True, min_values=1, max_values=10),
+        )
+        self.add_item(self.files)
 
-    async def callback(self, interaction: discord.Interaction) -> None:
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "Only the ticket opener can upload files from this prompt.",
+                ephemeral=True,
+            )
+            return
+        attachments = self.files.component.values
+        invalid = [
+            attachment.filename
+            for attachment in attachments
+            if not validate_upload_extension(attachment.filename)
+        ]
+        if invalid:
+            await interaction.response.send_message(
+                "Unsupported file format(s): "
+                + ", ".join(invalid)
+                + ". Accepted formats: .jpg, .png, .json, .zip, .txt, .mp3, .mp4.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
         try:
-            await interaction.response.send_modal(
-                TicketAcknowledgmentModal(
-                    self.cog,
-                    self.ticket_type_key,
-                    self.answers,
-                    self.acknowledgment,
-                    self.uploads,
+            uploads = [
+                {
+                    "filename": attachment.filename,
+                    "data": await attachment.read(),
+                }
+                for attachment in attachments
+            ]
+            channel = interaction.guild.get_channel(self.channel_id)
+            if channel is None:
+                channel = await interaction.guild.fetch_channel(self.channel_id)
+            if not self.cog._is_ticket_channel(channel):
+                raise RuntimeError("The original ticket is no longer open.")
+            for upload in uploads:
+                await channel.send(
+                    file=discord.File(
+                        io.BytesIO(upload["data"]), filename=upload["filename"]
+                    )
                 )
+        except (discord.Forbidden, discord.HTTPException, OSError, RuntimeError) as exc:
+            logger.exception("Could not attach Rulebreak evidence to ticket %s.", self.channel_id)
+            await interaction.followup.send(
+                f"The evidence could not be attached: {exc}", ephemeral=True
             )
-        except Exception:
-            logger.exception(
-                "Could not open acknowledgment modal for %s.",
-                self.ticket_type_key,
-            )
-            if not interaction.response.is_done():
-                await interaction.response.send_message(
-                    "The confirmation form could not be opened. Please try again.",
-                    ephemeral=True,
-                )
+            return
+        await interaction.followup.send("Evidence attached to your ticket.", ephemeral=True)
 
 
 class GeneralSupportModal(TicketSubmissionModal):
@@ -1366,8 +1379,8 @@ class TicketingCog(commands.Cog):
         answers: dict[str, str],
         ticket_type_key: str,
         uploads: list[dict[str, Any]],
-    ) -> None:
-        await self.create_ticket(interaction, answers, ticket_type_key, uploads)
+    ) -> discord.TextChannel | None:
+        return await self.create_ticket(interaction, answers, ticket_type_key, uploads)
 
     async def create_ticket(
         self,
@@ -1375,7 +1388,7 @@ class TicketingCog(commands.Cog):
         answers: dict[str, str],
         ticket_type: str,
         uploads: list[dict[str, Any]],
-    ) -> None:
+    ) -> discord.TextChannel | None:
         guild = interaction.guild
         if guild is None:
             await self._send_ephemeral(interaction, "Tickets can only be created in a server.")
@@ -1496,12 +1509,6 @@ class TicketingCog(commands.Cog):
                     value=answer or "N/A",
                     inline=False,
                 )
-            if acknowledgment := ticket_type_config.get("acknowledgment"):
-                opening_embed.add_field(
-                    name=acknowledgment,
-                    value=answers.get(acknowledgment, "") or "N/A",
-                    inline=False,
-                )
             if ticket_type == "whitelist_submission":
                 opening_content = (
                     f"Welcome to STALKER: Lost Zone, {requester.mention}! "
@@ -1553,6 +1560,7 @@ class TicketingCog(commands.Cog):
         await interaction.followup.send(
             f"Your ticket is ready: {channel.mention}", ephemeral=True
         )
+        return channel
 
     @staticmethod
     async def _send_ephemeral(interaction: discord.Interaction, content: str) -> None:

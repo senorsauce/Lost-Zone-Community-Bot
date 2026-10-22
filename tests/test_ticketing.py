@@ -12,12 +12,11 @@ from ticketing import (
     BugReportModal,
     CloseRequestModal,
     GeneralSupportModal,
-    TicketAcknowledgmentModal,
-    TicketAcknowledgmentView,
     TicketSubmissionModal,
     TicketPanelView,
     TicketingCog,
     TICKET_TYPES,
+    RulebreakEvidenceUploadModal,
     has_staff_role,
     parse_ticket_category_configs,
     parse_ticket_guild_configs,
@@ -76,6 +75,47 @@ class TicketUploadTests(unittest.TestCase):
 
 
 class TicketSubmissionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_rulebreak_checkbox_is_first_form_and_evidence_upload_is_offered_after(self):
+        created_channel = SimpleNamespace(id=123, mention="#rbr-0001")
+        cog = SimpleNamespace(
+            finish_ticket_submission=AsyncMock(return_value=created_channel)
+        )
+        modal = TicketSubmissionModal(cog, "rulebreaks")
+        self.assertIsNone(modal.upload_field)
+        self.assertEqual(modal.children[-1].text, "Required confirmation")
+        self.assertEqual(
+            modal.children[-1].component.options[0].label,
+            TICKET_TYPES["rulebreaks"]["acknowledgment"],
+        )
+        modal.confirmation._values = ["confirmed"]
+        response = SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock())
+        followup = SimpleNamespace(send=AsyncMock())
+        interaction = SimpleNamespace(
+            response=response,
+            followup=followup,
+            user=SimpleNamespace(id=42),
+        )
+
+        await modal.on_submit(interaction)
+
+        saved_answers = cog.finish_ticket_submission.await_args.args[1]
+        self.assertNotIn(TICKET_TYPES["rulebreaks"]["acknowledgment"], saved_answers)
+        upload_view = followup.send.await_args.kwargs["view"]
+        modal_response = SimpleNamespace(send_modal=AsyncMock())
+        await upload_view.children[0].callback(
+            SimpleNamespace(
+                response=modal_response,
+                user=SimpleNamespace(id=42),
+            )
+        )
+        evidence_modal = modal_response.send_modal.await_args.args[0]
+        self.assertIsInstance(evidence_modal, RulebreakEvidenceUploadModal)
+
+    async def test_rulebreak_evidence_modal_has_file_upload(self):
+        modal = RulebreakEvidenceUploadModal(SimpleNamespace(), 123, 42)
+        self.assertIsInstance(modal.files.component, discord.ui.FileUpload)
+        modal.to_dict()
+
     async def test_upload_submission_is_deferred_before_file_read(self):
         cog = SimpleNamespace(finish_ticket_submission=AsyncMock())
         modal = TicketSubmissionModal(cog, "general_support")
@@ -91,7 +131,7 @@ class TicketSubmissionTests(unittest.IsolatedAsyncioTestCase):
             return b"evidence"
 
         attachment.read = AsyncMock(side_effect=read_attachment)
-        modal.upload_field.component._values = [attachment]
+        modal.upload_field._values = [attachment]
         interaction = SimpleNamespace(
             response=response,
             followup=SimpleNamespace(send=AsyncMock()),
@@ -275,59 +315,38 @@ class TicketPanelStartupTests(unittest.IsolatedAsyncioTestCase):
                 response = SimpleNamespace(defer=AsyncMock())
                 followup = SimpleNamespace(send=AsyncMock())
                 modal = TicketSubmissionModal(cog, ticket_type)
+                if modal.confirmation is not None:
+                    modal.confirmation._values = ["confirmed"]
 
                 await modal.on_submit(
-                    SimpleNamespace(response=response, followup=followup)
+                    SimpleNamespace(
+                        response=response,
+                        followup=followup,
+                        user=SimpleNamespace(id=42),
+                    )
                 )
 
                 response.defer.assert_awaited_once_with(
                     ephemeral=True, thinking=True
                 )
-                if TICKET_TYPES[ticket_type].get("acknowledgment"):
-                    followup.send.assert_awaited_once()
-                    self.assertIsInstance(
-                        followup.send.await_args.kwargs["view"],
-                        TicketAcknowledgmentView,
-                    )
-                else:
-                    cog.finish_ticket_submission.assert_awaited_once()
+                cog.finish_ticket_submission.assert_awaited_once()
 
-    async def test_compensation_acknowledgment_uses_followup_and_button(self):
+    async def test_compensation_check_is_in_first_modal_and_not_saved_to_chat(self):
         cog = SimpleNamespace(finish_ticket_submission=AsyncMock())
         modal = TicketSubmissionModal(cog, "compensation_request")
-        response = SimpleNamespace(
-            defer=AsyncMock(),
-            is_done=Mock(return_value=True),
-            send_modal=AsyncMock(),
-        )
+        modal.confirmation._values = ["confirmed"]
+        response = SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock())
         followup = SimpleNamespace(send=AsyncMock())
         interaction = SimpleNamespace(response=response, followup=followup)
 
         await modal.on_submit(interaction)
 
         response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
-        followup.send.assert_awaited_once()
-        acknowledgment_view = followup.send.await_args.kwargs["view"]
-        button_response = SimpleNamespace(send_modal=AsyncMock())
-        await acknowledgment_view.children[0].callback(
-            SimpleNamespace(response=button_response)
-        )
+        cog.finish_ticket_submission.assert_awaited_once()
+        answers = cog.finish_ticket_submission.await_args.args[1]
+        self.assertNotIn(TICKET_TYPES["compensation_request"]["acknowledgment"], answers)
 
-        acknowledgment_modal = button_response.send_modal.await_args.args[0]
-        self.assertIsInstance(acknowledgment_modal, TicketAcknowledgmentModal)
-        self.assertEqual(
-            acknowledgment_modal.children[0].text,
-            "Required confirmation",
-        )
-        confirmation = acknowledgment_modal.children[0].component
-        self.assertTrue(confirmation.required)
-        self.assertEqual(confirmation.min_values, 1)
-        self.assertEqual(
-            [option.label for option in confirmation.options],
-            [TICKET_TYPES["compensation_request"]["acknowledgment"]],
-        )
-
-    async def test_evidence_checkbox_text_matches_each_report_type(self):
+    async def test_evidence_checkboxes_are_last_question_in_first_modal(self):
         expected = {
             "rulebreaks": (
                 "I have proof to back up my claims, and this submission is in good faith."
@@ -340,13 +359,10 @@ class TicketPanelStartupTests(unittest.IsolatedAsyncioTestCase):
 
         for ticket_type, checkbox_text in expected.items():
             with self.subTest(ticket_type=ticket_type):
-                acknowledgment = TICKET_TYPES[ticket_type]["acknowledgment"]
-                self.assertEqual(acknowledgment, checkbox_text)
-                modal = TicketAcknowledgmentModal(
-                    SimpleNamespace(), ticket_type, {}, acknowledgment
-                )
+                modal = TicketSubmissionModal(SimpleNamespace(), ticket_type)
+                self.assertEqual(modal.children[-1].text, "Required confirmation")
                 self.assertEqual(
-                    modal.children[0].component.options[0].label,
+                    modal.children[-1].component.options[0].label,
                     checkbox_text,
                 )
                 modal.to_dict()
@@ -390,7 +406,14 @@ class TicketPanelStartupTests(unittest.IsolatedAsyncioTestCase):
                     if label.description:
                         rendered_question += f" {label.description}"
                     self.assertEqual(rendered_question, question)
-                self.assertIsInstance(modal.children[-1].component, discord.ui.FileUpload)
+                if button.ticket_type_key == "rulebreaks":
+                    self.assertIsNone(modal.upload_field)
+                    self.assertIsInstance(
+                        modal.children[-1].component,
+                        discord.ui.CheckboxGroup,
+                    )
+                else:
+                    self.assertIsInstance(modal.upload_field, discord.ui.FileUpload)
                 modal.to_dict()
 
     async def test_category_precursors_match_requested_copy(self):
