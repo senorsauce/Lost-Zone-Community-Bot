@@ -18,6 +18,7 @@ LEGACY_PANEL_FOOTER = "zvtbot-ticket-panel-v1"
 CLOSE_REQUEST_FOOTER = "ticket-close-request-v1"
 DEFAULT_TRANSCRIPT_CHANNEL_ID = 1562225728651657337
 DEFAULT_TRANSCRIPT_CATEGORY_ID = 1522884583471714324
+DEFAULT_TICKET_ARCHIVE_CATEGORY_ID = 1531416783863550093
 ALLOWED_FILE_EXTENSIONS = {".jpg", ".png", ".json", ".zip", ".txt", ".mp3", ".mp4"}
 TICKET_TYPES = {
     "general_support": {
@@ -688,6 +689,12 @@ class TicketingCog(commands.Cog):
                 str(DEFAULT_TRANSCRIPT_CATEGORY_ID),
             )
         )
+        self.ticket_archive_category_id = int(
+            os.getenv(
+                "TICKET_ARCHIVE_CATEGORY_ID",
+                str(DEFAULT_TICKET_ARCHIVE_CATEGORY_ID),
+            )
+        )
         self._close_request_views_registered = False
         self.state = self._load_state()
         if self.state.get("ticket_types_version", 1) < 7:
@@ -816,6 +823,36 @@ class TicketingCog(commands.Cog):
             )
             return None
         return channel
+
+    async def _get_ticket_archive_category(
+        self, guild: discord.Guild
+    ) -> discord.CategoryChannel | None:
+        category = guild.get_channel(self.ticket_archive_category_id)
+        if category is None:
+            try:
+                category = await guild.fetch_channel(self.ticket_archive_category_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
+                logger.error(
+                    "Could not fetch ticket archive category %s for guild %s: %s",
+                    self.ticket_archive_category_id,
+                    guild.id,
+                    exc,
+                )
+                return None
+        if not isinstance(category, discord.CategoryChannel):
+            logger.error(
+                "Configured ticket archive %s is not a category.",
+                self.ticket_archive_category_id,
+            )
+            return None
+        if category.guild.id != guild.id:
+            logger.error(
+                "Ticket archive category %s is not in guild %s.",
+                category.id,
+                guild.id,
+            )
+            return None
+        return category
 
     async def _archive_ticket_transcript(
         self, ticket_channel: discord.TextChannel
@@ -1335,6 +1372,11 @@ class TicketingCog(commands.Cog):
             if request_message is not None and not request_message.embeds:
                 raise RuntimeError("The close request message has no confirmation embed.")
 
+            archive_category = await self._get_ticket_archive_category(channel.guild)
+            if archive_category is None:
+                raise RuntimeError(
+                    "The configured Ticket Archive category is unavailable."
+                )
             await self._archive_ticket_transcript(channel)
             previous_overwrite = channel.overwrites_for(requester)
             closed_overwrite = previous_overwrite
@@ -1358,7 +1400,7 @@ class TicketingCog(commands.Cog):
                         if topic
                         else "ticket_status=closed"
                     )
-                await channel.edit(topic=topic)
+                await channel.edit(topic=topic, category=archive_category)
             except Exception:
                 try:
                     await channel.set_permissions(

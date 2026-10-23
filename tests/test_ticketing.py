@@ -555,6 +555,7 @@ class StaffTicketCommandTests(unittest.IsolatedAsyncioTestCase):
         channel = SimpleNamespace(
             id=55,
             name="gen-0001",
+            guild=SimpleNamespace(id=123),
             topic="ticket_type=general_support;ticket_owner_id=11",
         )
         interaction = SimpleNamespace(
@@ -647,9 +648,12 @@ class StaffTicketCommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_accepting_close_request_locks_ticket_but_preserves_history(self):
         cog = await self._make_cog()
         cog._archive_ticket_transcript = AsyncMock()
+        archive_category = SimpleNamespace(id=987)
+        cog._get_ticket_archive_category = AsyncMock(return_value=archive_category)
         channel = SimpleNamespace(
             id=55,
             name="gen-0001",
+            guild=SimpleNamespace(id=123),
             topic="ticket_type=general_support;ticket_owner_id=11",
             overwrites_for=Mock(return_value=discord.PermissionOverwrite()),
             set_permissions=AsyncMock(),
@@ -675,17 +679,22 @@ class StaffTicketCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(overwrite.read_message_history)
         self.assertFalse(overwrite.send_messages)
         self.assertIn("ticket_status=closed", channel.edit.await_args.kwargs["topic"])
+        self.assertIs(channel.edit.await_args.kwargs["category"], archive_category)
         request_message.edit.assert_awaited_once()
         self.assertIsNone(request_message.edit.await_args.kwargs["view"])
 
     async def test_transcript_failure_leaves_ticket_open(self):
         cog = await self._make_cog()
+        cog._get_ticket_archive_category = AsyncMock(
+            return_value=SimpleNamespace(id=987)
+        )
         cog._archive_ticket_transcript = AsyncMock(
             side_effect=RuntimeError("transcript destination is unavailable")
         )
         channel = SimpleNamespace(
             id=55,
             name="gen-0001",
+            guild=SimpleNamespace(id=123),
             topic="ticket_type=general_support;ticket_owner_id=11",
             overwrites_for=Mock(return_value=discord.PermissionOverwrite()),
             set_permissions=AsyncMock(),
@@ -709,6 +718,8 @@ class StaffTicketCommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_staff_override_requires_confirmation_then_archives_and_closes(self):
         cog = await self._make_cog()
         cog._archive_ticket_transcript = AsyncMock()
+        archive_category = SimpleNamespace(id=987)
+        cog._get_ticket_archive_category = AsyncMock(return_value=archive_category)
         ticket_owner = SimpleNamespace(id=11)
         request_message = SimpleNamespace(
             embeds=[discord.Embed(title="Ticket closure request")],
@@ -766,6 +777,7 @@ class StaffTicketCommandTests(unittest.IsolatedAsyncioTestCase):
         cog._archive_ticket_transcript.assert_awaited_once_with(channel)
         channel.set_permissions.assert_awaited_once()
         self.assertIn("ticket_status=closed", channel.edit.await_args.kwargs["topic"])
+        self.assertIs(channel.edit.await_args.kwargs["category"], archive_category)
         request_message.edit.assert_awaited_once()
         self.assertIs(
             channel.set_permissions.await_args.args[0],
