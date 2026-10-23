@@ -1170,6 +1170,28 @@ class TicketingCog(commands.Cog):
         )
 
     @app_commands.command(
+        name="close", description="Close this ticket immediately"
+    )
+    @app_commands.guild_only()
+    @app_commands.check(has_staff_role)
+    async def close(self, interaction: discord.Interaction) -> None:
+        channel = await self._ticket_command_channel(interaction)
+        if channel is None:
+            return
+        owner_id = await self._resolve_ticket_owner_id(channel)
+        if owner_id is None:
+            await self._send_ephemeral(
+                interaction, "I could not determine the ticket opener; the ticket was not closed."
+            )
+            return
+        await self.accept_close_request(
+            interaction,
+            channel.id,
+            owner_id,
+            staff_override_confirmed=True,
+        )
+
+    @app_commands.command(
         name="closerequest", description="Request that the ticket owner close this ticket"
     )
     @app_commands.guild_only()
@@ -1309,8 +1331,8 @@ class TicketingCog(commands.Cog):
                 request_message = channel.get_partial_message(request_message_id)
                 request_message = await request_message.fetch()
             else:
-                request_message = interaction.message
-            if not request_message.embeds:
+                request_message = getattr(interaction, "message", None)
+            if request_message is not None and not request_message.embeds:
                 raise RuntimeError("The close request message has no confirmation embed.")
 
             await self._archive_ticket_transcript(channel)
@@ -1351,17 +1373,18 @@ class TicketingCog(commands.Cog):
                     )
                 raise
 
-            accepted_embed = request_message.embeds[0].copy()
-            accepted_embed.title = "Ticket closed"
-            accepted_embed.set_footer(text=f"{PANEL_FOOTER} | closed")
-            try:
-                await request_message.edit(embed=accepted_embed, view=None)
-            except (discord.Forbidden, discord.HTTPException):
-                logger.exception(
-                    "Ticket %s was closed, but close-request message %s was not updated.",
-                    channel.id,
-                    request_message.id,
-                )
+            if request_message is not None:
+                accepted_embed = request_message.embeds[0].copy()
+                accepted_embed.title = "Ticket closed"
+                accepted_embed.set_footer(text=f"{PANEL_FOOTER} | closed")
+                try:
+                    await request_message.edit(embed=accepted_embed, view=None)
+                except (discord.Forbidden, discord.HTTPException):
+                    logger.exception(
+                        "Ticket %s was closed, but close-request message %s was not updated.",
+                        channel.id,
+                        request_message.id,
+                    )
         except Exception as exc:
             logger.exception("Could not close ticket channel %s.", channel.id)
             await interaction.followup.send(

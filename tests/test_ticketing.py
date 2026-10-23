@@ -541,8 +541,36 @@ class StaffTicketCommandTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(await has_staff_role(staff_interaction))
         self.assertFalse(await has_staff_role(other_interaction))
-        for command in (TicketingCog.useradd, TicketingCog.userremove, TicketingCog.closerequest):
+        for command in (
+            TicketingCog.useradd,
+            TicketingCog.userremove,
+            TicketingCog.closerequest,
+            TicketingCog.close,
+        ):
             self.assertIn(has_staff_role, command.checks)
+
+    async def test_close_command_archives_and_closes_without_a_request_message(self):
+        cog = await self._make_cog()
+        cog.accept_close_request = AsyncMock()
+        channel = SimpleNamespace(
+            id=55,
+            name="gen-0001",
+            topic="ticket_type=general_support;ticket_owner_id=11",
+        )
+        interaction = SimpleNamespace(
+            channel=channel,
+            user=SimpleNamespace(id=33, roles=[SimpleNamespace(name="Staff")]),
+        )
+
+        with patch("ticketing.discord.TextChannel", type(channel)):
+            await TicketingCog.close.callback(cog, interaction)
+
+        cog.accept_close_request.assert_awaited_once_with(
+            interaction,
+            55,
+            11,
+            staff_override_confirmed=True,
+        )
 
     async def test_useradd_and_userremove_update_ticket_overwrites(self):
         cog = await self._make_cog()
